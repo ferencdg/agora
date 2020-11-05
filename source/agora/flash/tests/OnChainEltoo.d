@@ -21,6 +21,9 @@ import agora.script.Engine;
 import agora.script.Lock;
 import agora.script.Opcodes;
 import agora.script.Script;
+
+version (none):
+
 import agora.script.Signature;
 
 import std.bitmanip;
