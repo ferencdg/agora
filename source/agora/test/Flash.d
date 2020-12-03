@@ -202,6 +202,11 @@ public class SignTask
     /// Pending update tx to be signed after settlement tx is signed
     private Update pending_update;
 
+    /// Tasks for the various asynchronous API calls
+    private Timer request_settle_task;
+    /// Ditto
+    private Timer send_settle_task;
+
     /// Called when the settlement & update are signed & validated
     private void delegate (UpdatePair) onComplete;
 
@@ -213,8 +218,8 @@ public class SignTask
     }
 
     /// the initiator is either the funder or the receiver of a payment
-    public void run (in Transaction update_tx, in Output[] outputs,
-        in uint seq_id, void delegate (UpdatePair) onComplete)
+    public void run (in uint seq_id, in Transaction update_tx,
+        in Output[] outputs, void delegate (UpdatePair) onComplete)
     {
         assert(!this.running);
         this.clearState();
@@ -233,10 +238,10 @@ public class SignTask
 
         // todo: need some way of cancelling all tasks related to a stale
         // sequence ID (sometimes we may wish to restart with the same seq ID)
-        this.taskman.schedule(
+        this.request_settle_task = this.taskman.schedule(
         {
             if (auto error = this.peer.requestSettleSig(this.conf.chan_id,
-                update_tx, outputs, seq_id, our_nonce_kp.V))
+                seq_id, update_tx, outputs, our_nonce_kp.V))
             {
                 // todo: retry?
                 writefln("Requested settlement rejected: %s", error);
@@ -246,8 +251,8 @@ public class SignTask
     }
 
     /// Flash API
-    public string requestSettleSig (in Transaction prev_tx,
-        Output[] outputs, in uint seq_id, in Point peer_nonce_pk)
+    public string requestSettleSig (in Transaction prev_tx, Output[] outputs,
+        in Point peer_nonce_pk)
     {
         if (seq_id != this.seq_id)
             return "Unexpected sequence ID";
@@ -283,7 +288,7 @@ public class SignTask
             Transaction.init,  // trigger tx is revealed later
             outputs);
 
-        this.taskman.schedule(
+        this.send_settle_task = this.taskman.schedule(
         {
             if (auto error = this.peer.sendSettleSig(this.conf.chan_id,
                 seq_id, our_settle_nonce_kp.V, sig))
@@ -296,8 +301,7 @@ public class SignTask
         return null;
     }
 
-    public string sendSettleSig (in uint seq_id, in Point peer_nonce_pk,
-        in Signature peer_sig)
+    public string sendSettleSig (in Point peer_nonce_pk, in Signature peer_sig)
     {
         if (seq_id != this.seq_id)
             return "Unexpected sequence ID";
@@ -375,7 +379,7 @@ public class SignTask
                     Point.init,  // set later when we receive it from counter-party
                     trigger_tx);
 
-                this.taskman.schedule(
+                this.request_update_task = this.taskman.schedule(
                 {
                     if (auto error = this.peer.requestUpdateSig(this.conf.chan_id,
                         our_trigger_nonce_kp.V, trigger_tx))
@@ -433,7 +437,7 @@ public class SignTask
             peer_nonce_pk,
             trigger_tx);
 
-        this.taskman.schedule(
+        this.send_update_task = this.taskman.schedule(
         {
             this.peer.sendUpdateSig(this.conf.chan_id, our_trigger_nonce_kp.V,
                 our_sig);
@@ -442,8 +446,7 @@ public class SignTask
         return null;
     }
 
-    public string sendUpdateSig (in Point peer_nonce_pk,
-        in Signature peer_sig)
+    public string sendUpdateSig (in Point peer_nonce_pk, in Signature peer_sig)
     {
         writefln("%s: sendUpdateSig(%s)", this.kp.V.prettify,
             this.conf.chan_id.prettify);
@@ -492,7 +495,7 @@ public class SignTask
         if (this.is_owner)
         {
             // send the trigger signature
-            this.taskman.schedule(
+            this.send_update_task = this.taskman.schedule(
             {
                 if (auto error = this.peer.sendUpdateSig(
                     this.conf.chan_id, trigger.our_trigger_nonce_kp.V,
@@ -504,7 +507,7 @@ public class SignTask
 
             // also safe to finally send the settlement signature
             const seq_id_0 = 0;
-            this.taskman.schedule(
+            this.send_settle_task = this.taskman.schedule(
             {
                 if (auto error = this.peer.sendSettleSig(
                     this.conf.chan_id, seq_id_0,
@@ -519,13 +522,9 @@ public class SignTask
                 this.conf.chan_id.prettify,
                 this.conf.funding_tx.hashFull.prettify);
 
-            /// Store the funding so we can retry sending in case of failure
-            this.funding_tx_signed = this.conf.funding_tx
-                .serializeFull.deserializeFull!Transaction;
-            this.funding_tx_signed.inputs[0].unlock
-                = genKeyUnlock(sign(this.kp, this.conf.funding_tx));
-
-            this.txPublisher(this.funding_tx_signed);
+            this.taskman.schedule({
+                this.onComplete(UpdatePair.init);  // todo
+            });
         }
 
         return null;
@@ -538,6 +537,12 @@ public class SignTask
         this.running = false;
         this.pending_settle = Settlement.init;
         this.pending_update = Update.init;
+
+        // cancel any pending tasks
+        if (this.request_settle_task !is null)
+            this.request_settle_task.stop();
+        if (this.send_settle_task !is null)
+            this.send_settle_task.stop();
     }
 }
 
@@ -553,14 +558,14 @@ public class Channel
     /// Whether we are the funder of this channel (`funder_pk == this.kp.V`)
     public const bool is_owner;
 
+    /// Used to publish funding / trigger / update / settlement txs to blockchain
+    public const void delegate (in Transaction) txPublisher;
+
     /// The peer of the other end of the channel
     public FlashAPI peer;
 
     /// Task manager to spawn fibers with
     public SchedulingTaskManager taskman;
-
-    /// Used to publish funding / trigger / update / settlement txs to blockchain
-    public void delegate (in Transaction) txPublisher;
 
     /// Stored when the funding transaction is signed.
     /// For peers they receive this from the blockchain.
@@ -569,14 +574,18 @@ public class Channel
     /// Current stage of the channel
     private Stage stage;
 
-    /// The setup needed to start / end the channel
+    /// The signer for an update / settle pair
     private SignTask sign_task;
 
     /// Contains the trigger tx to initiate closing the channel,
     /// and the initial refund settlement.
     private UpdatePair trigger_pair;
 
-    private DList!UpdatePair channel_state;
+    /// The list of any off-chain updates which happened on this channel
+    private DList!UpdatePair channel_updates;
+
+    /// The current sequence ID
+    private uint cur_seq_id;
 
     // need it in order to publish to begin closing the channel
     //private Update pending_update;
@@ -609,65 +618,83 @@ public class Channel
         assert(!this.started);  // start() should be called once
         assert(this.is_owner);  // only funder initiates the channel
         assert(this.stage == Stage.Setup);
-
+        assert(this.cur_seq_id == 0);
         this.started = true;
 
         // create trigger, don't sign yet but do share it
         const uint seq_id = 0;
-        auto trigger_tx = createUpdateTx(this.conf, seq_id);
+        const trigger_tx = createUpdateTx(this.conf, seq_id);
 
         // initial output allocates all the funds back to the channel creator
         Output[] outputs = [Output(this.conf.funding_amount,
             PublicKey(this.conf.funder_pk[]))];
 
-        this.sign_task.run(trigger_tx, outputs, &this.onSetupComplete);
+        this.sign_task.run(seq_id, trigger_tx, outputs, &this.onSetupComplete);
     }
 
+    ///
     private void onSetupComplete (UpdatePair trigger_pair)
     {
         this.stage = Stage.WaitForFunding;
         this.trigger_pair = update_pair;
+
+        this.funding_tx_signed = this.conf.funding_tx
+            .serializeFull.deserializeFull!Transaction;
+        this.funding_tx_signed.inputs[0].unlock
+            = genKeyUnlock(sign(this.kp, this.conf.funding_tx));
+
+        this.txPublisher(this.funding_tx_signed);
+        this.sign_task.clearState();
+        this.cur_seq_id++;
     }
 
-    /// Flash API
-    public string requestSettleSig (in Transaction prev_tx,
-        Output[] outputs, in uint seq_id, in Point peer_nonce_pk)
+    ///
+    public string requestSettleSig (in uint seq_id, in Transaction prev_tx,
+        Output[] outputs, in Point peer_nonce_pk)
     {
-        return this.sign_task.requestSettleSig(prev_tx, outputs, seq_id,
-            peer_nonce_pk);
+        if (auto error = this.isInvalidSeq(seq_id))
+            return error;
+
+        return this.sign_task.requestSettleSig(prev_tx, outputs, peer_nonce_pk);
     }
 
+    ///
     public string sendSettleSig (in uint seq_id, in Point peer_nonce_pk,
         in Signature peer_sig)
     {
-        return this.sign_task.sendSettleSig(seq_id, peer_nonce_pk,
-            peer_sig);
+        if (auto error = this.isInvalidSeq(seq_id))
+            return error;
+
+        return this.sign_task.sendSettleSig(peer_nonce_pk, peer_sig);
     }
 
-    public string requestUpdateSig (in Point peer_nonce_pk,
-        Transaction trigger_tx)
-    {
-        return this.sign_task.requestUpdateSig(peer_nonce_pk, trigger_tx);
-    }
-
-    public string sendUpdateSig (in Point peer_nonce_pk,
-        in Signature peer_sig)
-    {
-        return this.sign_task.requestUpdateSig(peer_nonce_pk, trigger_tx);
-    }
-
+    ///
     public string requestUpdateSig (in uint seq_id, in Point peer_nonce_pk,
         Transaction update_tx)
     {
-        return this.sign_task.requestUpdateSig(seq_id, peer_nonce_pk,
-            update_tx);
+        if (auto error = this.isInvalidSeq(seq_id))
+            return error;
+
+        return this.sign_task.requestUpdateSig(peer_nonce_pk, update_tx);
     }
 
+    ///
     public string sendUpdateSig (in uint seq_id, in Point peer_nonce_pk,
         in Signature peer_sig)
     {
-        return this.sign_task.sendUpdateSig(seq_id, peer_nonce_pk,
-            peer_sig);
+        if (auto error = this.isInvalidSeq(seq_id))
+            return error;
+
+        return this.sign_task.sendUpdateSig(peer_nonce_pk, peer_sig);
+    }
+
+    ///
+    private string isInvalidSeq (in uint seq_id)
+    {
+        if (seq_id != this.cur_seq_id)
+            return "Invalid sequence ID";
+
+        return null;
     }
 }
 
@@ -1463,9 +1490,9 @@ public Point getSettlePk (in Point origin, in Hash utxo, in ulong seq_id,
 private class SchedulingTaskManager : LocalRestTaskManager
 {
     /// Ditto
-    public void schedule (void delegate() dg) nothrow
+    public Timer schedule (void delegate() dg) nothrow
     {
-        super.setTimer(0.seconds, dg);
+        return super.setTimer(0.seconds, dg);
     }
 }
 
