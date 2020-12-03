@@ -38,6 +38,7 @@ import geod24.Registry;
 import libsodium.randombytes;
 
 import std.bitmanip;
+import std.container.dlist;
 import std.conv;
 import std.exception;
 import std.format;
@@ -149,37 +150,265 @@ public struct ChannelConfig
 /// Stages can only move forwards, and never back.
 public enum Stage
 {
-    /// The channel has been accepted. The funding tx is known.
-    Initializing = 1,
+    /// Cooperating on the initial trigger and settlement txs
+    Setup,
 
-    /// start() was called
-    Starting,
+    /// Waiting for the funding tx to appear in the blockchain
+    WaitForFunding,
 
-    /// Whether we've received the signed settlement transaction
-    /// which attaches to the trigger transaction
-    ReceivedInitialSettlement,
+    /// The channel is open.
+    Open,
 
-    /// Whether we've received the signed trigger transaction
-    /// which attaches to the funding transaction
-    ReceivedInitialTrigger,
-
-    /// Whether the funding transaction was externalized in the blockchain.
-    /// This signals the channel is now open.
-    FundingExternalized,
+    /// The channel is closed.
+    Closed,
 }
 
-/// Tracks the current state of the channel
-public struct ChannelState
+/// Contains the channel close trigger transaction and the initial settlement
+/// which refunds the entire channel's funds back to its founder.
+/// Note that the funding tx is in the `ChannelConfig`.
+public class TriggerPair
 {
-    /// Current stage in the channel.
-    public Stage stage = Stage.Initializing;
+    /// The initial trigger tx which will trigger a timeout on the blockchain
+    /// after which the `refund_funding` tx below may be attached.
+    /// Another update transaction can double-spend this trigger tx's outputs
+    /// before the `settle_tx` settlement tx tries to spend it.
+    private Update trigger_tx;
 
-    /// The current update / settlement sequence ID. Only valid if
-    /// TODO: `stage` >= `Stage.`
-    public uint seq_id = 0;
+    /// The initial settlement tx which refunds the entire channel
+    /// back to the channel's founder. It spends the `update_tx` outputs.
+    private Settlement settle_tx;
+}
+
+/// The update & settle pair for a given sequence ID
+public class UpdatePair
+{
+    /// The sequence ID of this slot
+    public uint seq_id;
+
+    /// Update which spends the trigger tx's outputs and can replace
+    /// any previous update containing a lower sequence ID than this one's.
+    private Update update;
+
+    /// Settlement which spends from `update`
+    private Settlement settlement;
 }
 
 ///
+public class SignTask
+{
+    /// Channel configuration
+    private const ChannelConfig conf;
+
+    /// Peer we're communicating with
+    private FlashAPI peer;
+
+    /// Sequence ID we're trying to sign for
+    private uint seq_id;
+
+    /// Called when the settlement & update are signed & validated
+    private void delegate (UpdatePair) onComplete;
+
+    /// Pending settlement tx to be signed
+    private Settlement pending_settle;
+
+    /// Pending update tx to be signed after settlement tx is signed
+    private Update pending_update;
+
+    /// Whether we're currently running
+    private bool running;
+
+    ///
+    public this (in ChannelConfig conf)
+    {
+        assert(state !is null);
+        this.ready = ready;
+    }
+
+    /// the initiator is either the funder or the receiver of a payment
+    public void run (in Transaction update_tx, in Output[] outputs,
+        in uint seq_id, void delegate (UpdatePair) onComplete)
+    {
+        assert(!this.running);
+        this.running = true;
+
+        this.seq_id = seq_id;
+        this.onComplete = onComplete;
+        this.pending_settlement = Settlement.init;
+        this.pending_update = Update.init;
+
+        const our_nonce_kp = Pair.random();
+        this.pending_settlement = Settlement(
+            our_nonce_kp,
+            Point.init, // set later when we receive it from the peer
+            update_tx,
+            outputs);
+
+        // todo: need some way of cancelling all tasks related to a stale
+        // sequence ID (sometimes we may wish to restart with the same seq ID)
+        this.taskman.schedule(
+        {
+            if (auto error = this.peer.requestSettlementSig(this.conf.chan_id,
+                update_tx, outputs, seq_id, our_nonce_kp.V))
+            {
+                // todo: retry?
+                writefln("Requested settlement rejected: %s", error);
+                assert(0);
+            }
+        });
+    }
+
+    /// Flash API
+    public string requestSettlementSig (in Transaction prev_tx,
+        Output[] outputs, in uint seq_id, in Point peer_nonce_pk)
+    {
+        if (seq_id != this.seq_id)
+            return "Unexpected sequence ID";
+
+        // todo: should not accept this unless acceptsChannel() was called
+        writefln("%s: requestSettlementSig(%s)", this.kp.V.prettify,
+            this.conf.chan_id.prettify);
+
+        /* todo: verify sequence ID is not an older sequence ID */
+        /* todo: verify prev_tx is not one of our own transactions */
+
+        const our_settle_nonce_kp = Pair.random();
+
+        const settle_tx = createSettleTx(prev_tx, this.conf.settle_time,
+            outputs);
+        const uint input_idx = 0;
+        const challenge_settle = getSequenceChallenge(settle_tx, seq_id,
+            input_idx);
+
+        const our_settle_scalar = getSettleScalar(this.kp.v,
+            this.conf.funding_tx_hash, seq_id);
+        const settle_pair_pk = getSettlePk(this.conf.pair_pk,
+            this.conf.funding_tx_hash, seq_id, this.conf.num_peers);
+        const nonce_pair_pk = our_settle_nonce_kp.V + peer_nonce_pk;
+
+        const sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
+            our_settle_nonce_kp.v, challenge_settle);
+
+        // we also expect the counter-party to give us their signature
+        this.pending_settlement = Settlement(
+            seq_id, our_settle_nonce_kp,
+            peer_nonce_pk,
+            Transaction.init,  // trigger tx is revealed later
+            outputs);
+
+        this.taskman.schedule(
+        {
+            if (auto error = this.peer.receiveSettlementSig(this.conf.chan_id,
+                seq_id, our_settle_nonce_kp.V, sig))
+            {
+                // todo: retry?
+                writefln("Peer rejected settlement tx: %s", error);
+            }
+        });
+
+        return null;
+    }
+
+    public string receiveSettlementSig (in uint seq_id, in Point peer_nonce_pk,
+        in Signature peer_sig)
+    {
+        if (seq_id != this.seq_id)
+            return "Unexpected sequence ID";
+
+        writefln("%s: receiveSettlementSig(%s)", this.kp.V.prettify,
+            this.conf.chan_id.prettify);
+
+        auto settle = &this.pending_settlement;
+        settle.their_settle_nonce_pk = peer_nonce_pk;
+
+        // recreate the settlement tx
+        auto settle_tx = createSettleTx(settle.prev_tx,
+            this.conf.settle_time, settle.outputs);
+        const uint input_idx = 0;
+        const challenge_settle = getSequenceChallenge(settle_tx, seq_id,
+            input_idx);
+
+        // todo: send the signature back via receiveSettlementSig()
+        // todo: add pending settlement to the other peer's pending settlements
+
+        // Kim received the <settlement, signature> tuple.
+        // he signs it, and finishes the multisig.
+        Pair our_settle_origin_kp;
+        Point their_settle_origin_pk;
+
+        const our_settle_scalar = getSettleScalar(this.kp.v, this.conf.funding_tx_hash,
+            seq_id);
+        const settle_pair_pk = getSettlePk(this.conf.pair_pk, this.conf.funding_tx_hash,
+            seq_id, this.conf.num_peers);
+        const nonce_pair_pk = settle.our_settle_nonce_kp.V
+            + settle.their_settle_nonce_pk;
+
+        const our_sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
+            settle.our_settle_nonce_kp.v, challenge_settle);
+        settle.our_sig = our_sig;
+
+        const settle_sig_pair = Sig(nonce_pair_pk,
+              Sig.fromBlob(our_sig).s
+            + Sig.fromBlob(peer_sig).s).toBlob();
+
+        if (!verify(settle_pair_pk, settle_sig_pair, challenge_settle))
+            return "Settlement signature is invalid";
+
+        writefln("%s: receiveSettlementSig(%s) VALIDATED for seq id %s",
+            this.kp.V.prettify, this.conf.chan_id.prettify, seq_id);
+
+        // unlock script set
+        const Unlock settle_unlock = createUnlockSettle(settle_sig_pair, seq_id);
+        settle_tx.inputs[0].unlock = settle_unlock;
+
+        // note: this step may not look necessary but it can fail if there are
+        // any incompatibilities with the script generators and the engine
+        // (e.g. sequence ID being 4 bytes instead of 8)
+        const TestStackMaxTotalSize = 16_384;
+        const TestStackMaxItemSize = 512;
+        scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
+        if (auto error = engine.execute(
+            settle.prev_tx.outputs[0].lock, settle_unlock, settle_tx,
+                settle_tx.inputs[0]))
+        {
+            assert(0, error);
+        }
+
+        this.last_settlement = *settle;
+
+        // todo: protect against replay attacks. we do not want an infinite
+        // loop scenario
+        if (this.conf.funder_pk == this.kp.V)
+        {
+            if (seq_id == 0)
+            {
+                auto trigger_tx = settle.prev_tx;
+                const our_trigger_nonce_kp = Pair.random();
+
+                this.pending_trigger = Trigger(
+                    our_trigger_nonce_kp,
+                    Point.init,  // set later when we receive it from counter-party
+                    trigger_tx);
+
+                this.taskman.schedule(
+                {
+                    if (auto error = this.peer.requestTriggerSig(this.conf.chan_id,
+                        our_trigger_nonce_kp.V, trigger_tx))
+                    {
+                        writefln("Error calling requestTriggerSig(): %s", error);
+                    }
+                });
+            }
+            else
+            {
+                // settlement with seq id 1 attaches to update with seq id 1
+            }
+        }
+
+        return null;
+    }
+}
+
+/// Contains all the logic for maintaining a channel
 public class Channel
 {
     /// The static information about this channel
@@ -189,7 +418,7 @@ public class Channel
     public const Pair kp;
 
     /// Whether we are the funder of this channel (`funder_pk == this.kp.V`)
-    public const bool is_funder;
+    public const bool is_owner;
 
     /// The peer of the other end of the channel
     public FlashAPI peer;
@@ -197,15 +426,38 @@ public class Channel
     /// Task manager to spawn fibers with
     public SchedulingTaskManager taskman;
 
-    /// Used to publish funding / trigger / update / settlement tx's to blockchain
+    /// Used to publish funding / trigger / update / settlement txs to blockchain
     public void delegate (in Transaction) txPublisher;
 
     /// Stored when the funding transaction is signed.
     /// For peers they receive this from the blockchain.
     public Transaction funding_tx_signed;
 
-    /// Current state of the channel
-    public ChannelState state;
+    /// Current stage of the channel
+    private Stage stage;
+
+    /// The setup needed to start / end the channel
+    private SignTask sign_task;
+
+    /// Contains the trigger tx to initiate closing the channel,
+    /// and the initial refund settlement.
+    private UpdatePair trigger_pair;
+
+    private DList!UpdatePair channel_state;
+
+    // need it in order to publish to begin closing the channel
+    //private Update pending_trigger;
+    //private Settlement pending_settlement;
+
+    //private Update pending_update;
+
+    //// all of these must be set before channel is considered opened
+    //private Trigger trigger;
+    //private Settlement last_settlement;
+    //private Update last_update;
+    //private bool funding_externalized;
+
+    private bool started;  // only used by the funder
 
     /// Ctor
     public this (in ChannelConfig conf, in Pair kp, FlashAPI peer,
@@ -214,59 +466,37 @@ public class Channel
     {
         this.conf = conf;
         this.kp = kp;
-        this.is_funder = conf.funder_pk == kp.V;
+        this.is_owner = conf.funder_pk == kp.V;
         this.peer = peer;
         this.taskman = taskman;
         this.txPublisher = txPublisher;
+        this.sign_task = new SignTask(this.conf, this.peer);
     }
 
     /// Start routine for the channel funder
     public void start ()
     {
-        assert(this.is_funder);  // only funder initiates the channel
-        assert(this.state.stage < Stage.Starting);  // start() should be called once
+        assert(!this.started);  // start() should be called once
+        assert(this.is_owner);  // only funder initiates the channel
+        assert(this.stage == Stage.Setup);
 
-        this.state.stage = Stage.Starting;
+        this.started = true;
 
         // create trigger, don't sign yet but do share it
-        const next_seq_id = 0;
-        auto trigger_tx = createUpdateTx(this.conf, next_seq_id);
+        const uint seq_id = 0;
+        auto trigger_tx = createUpdateTx(this.conf, seq_id);
 
         // initial output allocates all the funds back to the channel creator
-        Output output = Output(this.conf.funding_amount,
-            PublicKey(this.conf.funder_pk[]));
-        Output[] initial_outputs = [output];
+        Output[] outputs = [Output(this.conf.funding_amount,
+            PublicKey(this.conf.funder_pk[]))];
 
-        // first nonce for the settlement
-        const nonce_kp = Pair.random();
-        const seq_id_0 = 0;
+        this.sign_task.run(trigger_tx, outputs, &this.onSetupComplete);
+    }
 
-        // todo: let's move the first settlement and trigger here,
-        // and make all the calls blocking?
-        // then after channel is set up, we just exit the fiber here
-        // (this would be a fiber),
-        // and let the FlashAPI dispatch to the appropriate routine
-
-        this.pending_settlement = Settlement(
-            this.conf.chan_id, seq_id_0, nonce_kp,
-            Point.init, // set later when we receive it from counter-party
-            trigger_tx,
-            initial_outputs);
-
-        this.taskman.schedule(
-        {
-            // request the peer to create a signed settlement transaction spending
-            // from the trigger tx.
-            if (auto error = this.peer.requestSettlementSig(this.conf.chan_id,
-                trigger_tx, initial_outputs, seq_id_0, nonce_kp.V))
-            {
-                // todo: retry?
-                writefln("Requested settlement rejected: %s", error);
-                assert(0);
-            }
-        }
-
-        while (!)
+    private void onSetupComplete (UpdatePair trigger_pair)
+    {
+        this.stage = Stage.WaitForFunding;
+        this.trigger_pair = update_pair;
     }
 
     /// Flash API
@@ -299,7 +529,7 @@ public class Channel
 
         // we also expect the counter-party to give us their signature
         this.pending_settlement = Settlement(
-            this.conf.chan_id, seq_id, our_settle_nonce_kp,
+            seq_id, our_settle_nonce_kp,
             peer_nonce_pk,
             Transaction.init,  // trigger tx is revealed later
             outputs);
@@ -391,7 +621,6 @@ public class Channel
                 const our_trigger_nonce_kp = Pair.random();
 
                 this.pending_trigger = Trigger(
-                    this.conf.chan_id,
                     our_trigger_nonce_kp,
                     Point.init,  // set later when we receive it from counter-party
                     trigger_tx);
@@ -450,7 +679,6 @@ public class Channel
             nonce_pair_pk, our_trigger_nonce_kp.v, trigger_tx);
 
         this.pending_trigger = Trigger(
-            this.conf.chan_id,
             our_trigger_nonce_kp,
             peer_nonce_pk,
             trigger_tx);
@@ -511,7 +739,7 @@ public class Channel
             this.conf.chan_id.prettify);
 
         // this prevents infinite loops, we may want to optimize this
-        if (this.is_funder)
+        if (this.is_owner)
         {
             // send the trigger signature
             this.taskman.schedule(
@@ -597,7 +825,6 @@ public class Channel
             nonce_pair_pk, our_update_nonce_kp.v, update_tx);
 
         this.pending_update = Update(
-            this.conf.chan_id,
             seq_id,
             our_update_nonce_kp,
             peer_nonce_pk,
@@ -662,7 +889,7 @@ public class Channel
         this.last_update = *update;
 
         // this prevents infinite loops, we may want to optimize this
-        if (this.is_funder)
+        if (this.is_owner)
         {
             // send the update signature
             this.taskman.schedule(
@@ -678,33 +905,11 @@ public class Channel
 
         return null;
     }
-
-    // need it in order to publish to begin closing the channel
-    Trigger pending_trigger;
-    Settlement pending_settlement;
-    Update pending_update;
-
-    // all of these must be set before channel is considered opened
-    Trigger trigger;
-    Settlement last_settlement;
-    Update last_update;
-    bool funding_externalized;
-}
-
-///
-public struct Trigger
-{
-    Hash chan_id;
-    Pair our_trigger_nonce_kp;
-    Point their_trigger_nonce_pk;
-    Transaction tx;
 }
 
 ///
 public struct Update
 {
-    Hash chan_id;
-    uint seq_id;
     Pair our_update_nonce_kp;
     Point their_update_nonce_pk;
     Transaction update_tx;
@@ -713,8 +918,6 @@ public struct Update
 ///
 public struct Settlement
 {
-    Hash chan_id;
-    uint seq_id;
     Pair our_settle_nonce_kp;
     Point their_settle_nonce_pk;
     Transaction prev_tx;
@@ -1300,12 +1503,12 @@ private Transaction createFundingTx (in Hash utxo, in Amount funding_amount,
     return funding_tx;
 }
 
-/// Also used for the first trigger tx (using next_seq_id of 0)
+///
 private Transaction createUpdateTx (in ChannelConfig chan_conf,
-    in uint next_seq_id)
+    in uint seq_id)
 {
     const Lock = createLockEltoo(chan_conf.settle_time,
-        chan_conf.funding_tx_hash, chan_conf.pair_pk, next_seq_id,
+        chan_conf.funding_tx_hash, chan_conf.pair_pk, seq_id,
         chan_conf.num_peers);
 
     Transaction update_tx = {
@@ -1335,7 +1538,8 @@ private string prettify (T)(T input)
         pair_pk = the Schnorr sum of the multi-party public keys.
                   The update an settlement keys will be derived from this
                   origin.
-        next_seq_id = the sequence ID to lock to for the update spend branch
+        seq_id = the sequence ID to use for the settlement branch. For the
+            update branch `seq_id + 1` will be used.
 
     Returns:
         a lock script which can be unlocked instantly with an update key-pair,
@@ -1345,7 +1549,7 @@ private string prettify (T)(T input)
 *******************************************************************************/
 
 public Lock createLockEltoo (uint age, Hash first_utxo, Point pair_pk,
-    ulong next_seq_id, uint num_peers)
+    ulong seq_id, uint num_peers)
     //pure nothrow @safe
 {
     /*
@@ -1355,7 +1559,7 @@ public Lock createLockEltoo (uint age, Hash first_utxo, Point pair_pk,
         otherwise an attacker could just steal the signature
         and use a different PUSH to evaluate the other branch.
 
-        To force only a specific settlement tx to be valid, we need to make
+        To force only a specific settlement tx to be valid we need to make
         the settle key derived for each sequence ID. That way an attacker
         cannot attach any arbitrary settlement to any other update.
 
@@ -1363,63 +1567,42 @@ public Lock createLockEltoo (uint age, Hash first_utxo, Point pair_pk,
         - we use naive schnorr multisig for simplicity
         - we use VERIFY_SIG rather than CHECK_SIG, it improves testing
           reliability by ensuring the right failure reason is emitted.
-          We manually push OP.TRUE to the stack after the verify.
+          We manually push OP.TRUE to the stack after the verify. (temporary)
         - VERIFY_SEQ_SIG expects a push of the sequence on the stack by
           the unlock script, and hashes the sequence to produce a signature.
 
         Explanation:
         [sig] - signature pushed by the unlock script.
-        [new_seq] - sequence ID pushed by the unlock script.
+        [spend_seq] - sequence ID pushed by the unlock script in the spending tx.
         <seq + 1> - minimum sequence ID as set by the lock script. It's +1
-            to allow binding of the next update TX (or any future update TX).
-        OP.VERIFY_SEQ_SIG - verifies that [new_seq] >= <seq + 1>.
-            Hashes the blanked Input together with the [new_seq] that was
-            pushed to the stack. Then verifies the signature.
+            to allow binding of the next update tx (or any future update tx).
+        OP.VERIFY_SEQ_SIG - verifies that [spend_seq] >= <seq + 1>.
+            Hashes the blanked Input together with the [spend_seq] that was
+            pushed to the stack and then verifies the signature.
 
         OP.IF
-            <age> OP.VERIFY_UNLOCK_AGE
-            [sig] [new_seq] <seq + 1> <settle_pub_multi[new_seq]> OP.VERIFY_SEQ_SIG OP.TRUE
+            [sig] [spend_seq] <seq + 1> <update_pub_multi> OP.VERIFY_SEQ_SIG OP.TRUE
         OP_ELSE
-            [sig] [new_seq] <seq + 1> <update_pub_multi> OP.VERIFY_SEQ_SIG OP.TRUE
+            <age> OP.VERIFY_UNLOCK_AGE
+            [sig] [spend_seq] <seq> <settle_pub_multi[spend_seq]> OP.VERIFY_SEQ_SIG OP.TRUE
         OP_ENDIF
     */
 
     const update_pair_pk = getUpdatePk(pair_pk, first_utxo, num_peers);
-    const next_settle_pair_pk = getSettlePk(pair_pk, first_utxo,
-        next_seq_id, num_peers);
+    const settle_pair_pk = getSettlePk(pair_pk, first_utxo, seq_id, num_peers);
     const age_bytes = nativeToLittleEndian(age);
-    const ubyte[8] seq_id_bytes = nativeToLittleEndian(next_seq_id);
+    const ubyte[8] seq_id_bytes = nativeToLittleEndian(seq_id);
+    const ubyte[8] next_seq_id_bytes = nativeToLittleEndian(seq_id + 1);
 
     return Lock(LockType.Script,
         [ubyte(OP.IF)]
-            ~ toPushOpcode(age_bytes) ~ [ubyte(OP.VERIFY_UNLOCK_AGE)]
-            ~ [ubyte(32)] ~ next_settle_pair_pk[] ~ toPushOpcode(seq_id_bytes)
-                ~ [ubyte(OP.VERIFY_SEQ_SIG), ubyte(OP.TRUE),
+            ~ [ubyte(32)] ~ update_pair_pk[] ~ toPushOpcode(next_seq_id_bytes)
+            ~ [ubyte(OP.VERIFY_SEQ_SIG), ubyte(OP.TRUE),
          ubyte(OP.ELSE)]
-            ~ [ubyte(32)] ~ update_pair_pk[] ~ toPushOpcode(seq_id_bytes)
+             ~ toPushOpcode(age_bytes) ~ [ubyte(OP.VERIFY_UNLOCK_AGE)]
+            ~ [ubyte(32)] ~ settle_pair_pk[] ~ toPushOpcode(seq_id_bytes)
                 ~ [ubyte(OP.VERIFY_SEQ_SIG), ubyte(OP.TRUE),
          ubyte(OP.END_IF)]);
-}
-
-/*******************************************************************************
-
-    Create an unlock script for the settlement branch for Eltoo Figure 4.
-
-    Params:
-        sig = the signature
-
-    Returns:
-        an unlock script
-
-*******************************************************************************/
-
-public Unlock createUnlockSettle (Signature sig, in ulong sequence)
-    pure nothrow @safe
-{
-    // remember it's LIFO when popping, TRUE goes last
-    const seq_bytes = nativeToLittleEndian(sequence);
-    return Unlock([ubyte(64)] ~ sig[] ~ toPushOpcode(seq_bytes)
-        ~ [ubyte(OP.TRUE)]);
 }
 
 /*******************************************************************************
@@ -1437,7 +1620,28 @@ public Unlock createUnlockSettle (Signature sig, in ulong sequence)
 public Unlock createUnlockUpdate (Signature sig, in ulong sequence)
     pure nothrow @safe
 {
-    // remember it's LIFO when popping, FALSE goes last
+    // remember it's LIFO when popping, TRUE is pushed last
+    const seq_bytes = nativeToLittleEndian(sequence);
+    return Unlock([ubyte(64)] ~ sig[] ~ toPushOpcode(seq_bytes)
+        ~ [ubyte(OP.TRUE)]);
+}
+
+/*******************************************************************************
+
+    Create an unlock script for the settlement branch for Eltoo Figure 4.
+
+    Params:
+        sig = the signature
+
+    Returns:
+        an unlock script
+
+*******************************************************************************/
+
+public Unlock createUnlockSettle (Signature sig, in ulong sequence)
+    pure nothrow @safe
+{
+    // remember it's LIFO when popping, FALSE is pushed last
     const seq_bytes = nativeToLittleEndian(sequence);
     return Unlock([ubyte(64)] ~ sig[] ~ toPushOpcode(seq_bytes)
         ~ [ubyte(OP.FALSE)]);
