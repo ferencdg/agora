@@ -101,6 +101,144 @@ alias LockType = agora.script.Lock.LockType;
 // time. how does C-LN handle this? Maybe the sequence ID should be part of
 // the invoice, and only one can cooperatively be accepted.
 
+public struct SigResult
+{
+    string error;  // in case there was something wrong
+    Signature sig;
+}
+
+/// This is the API that each flash-aware node must implement.
+public interface FlashAPI
+{
+    /***************************************************************************
+
+        Requests opening a channel with this node.
+
+        Params:
+            chan_conf = contains all the static configuration for this channel.
+
+        Returns:
+            null if agreed to open this channel, otherwise an error
+
+    ***************************************************************************/
+
+    public string openChannel (in ChannelConfig chan_conf);
+
+    /***************************************************************************
+
+        Request the peer to create a floating settlement transaction that spends
+        the outputs of the provided previous transaction, and creates the given
+        new outputs and encodes the given signed sequence ID in the
+        unlock script.
+
+        The peer may reject to create such a settlement, for example if the
+        sequence ID is outdated, or if the peer disagrees with the allocation
+        of the funds in the new outputs, or if the outputs try to spend more
+        than the allocated amount.
+
+        Params:
+            chan_id = A previously seen pending channel ID provided
+                by the funder node through the call to `openChannel()`
+            prev_tx = the transaction whose outputs should be spent
+            outputs = the outputs reallocating the funds
+            seq_id = the sequence ID
+            peer_nonce = the nonce the calling peer is using for its
+                own signature
+
+        Returns:
+            null, or an error string if the channel could not be created
+
+    ***************************************************************************/
+
+    public SigResult requestSettleSig (in Hash chan_id,
+        in uint seq_id, in Transaction prev_tx, Output[] outputs,
+        in Point peer_nonce);
+
+    /***************************************************************************
+
+        Provide a settlement transaction that was requested by another peer
+        through the `requestSettleSig()`.
+
+        Note that the settlement transaction itself is not sent back,
+        because the requester already knows what the settlement transaction
+        should look like. Only the signature should be sent back.
+
+        Params:
+            chan_id = A previously seen pending channel ID provided
+                by the funder node through the call to `openChannel()`
+            seq_id = the sequence ID
+            peer_nonce = the nonce the calling peer is using for its
+                own signature
+            peer_sig = the partial signature that needs to be complimented by
+                the second half of the settlement requester
+
+        Returns:
+            null, or an error string if the channel could not be created
+
+    ***************************************************************************/
+
+    public string receiveSettleSig (in Hash chan_id, in uint seq_id,
+        in Point peer_nonce, in Signature peer_sig);
+
+    /***************************************************************************
+
+        Request the peer to sign the trigger transaction, from which the
+        settlement transaction spends.
+
+        The peer should use the agreed-upon update key-pair and the nonce
+        sum of the provided nonce and the peer's own genereated nonce
+        to enable schnorr multisig signatures.
+
+        The peer should then call `receiveUpdateSig()` to return their
+        end of the signature. The calling node will then also provide
+        their part of the signature in a call to `receiveUpdateSig()`,
+        making the symmetry complete.
+
+        Params:
+            chan_id = A previously seen pending channel ID provided
+                by the funder node through the call to `openChannel()`
+            peer_nonce = the nonce the calling peer is using for its
+                own signature
+
+        Returns:
+            null, or an error string if the peer could not sign the trigger
+            transaction for whatever reason
+
+    ***************************************************************************/
+
+    public string requestUpdateSig (in Hash chan_id, in uint seq_id,
+        in Point peer_nonce, Transaction update_tx);
+
+    /***************************************************************************
+
+        Return a signature for the trigger transaction for the previously
+        requested one via requestUpdateSig().
+
+        The peer should use the agreed-upon update key-pair and the nonce
+        sum of the provided nonce and the peer's own genereated nonce
+        to enable schnorr multisig signatures.
+
+        The peer should then call `receiveUpdateSig()` to return their
+        end of the signature. The calling node will then also provide
+        their part of the signature in a call to `receiveUpdateSig()`,
+        making the symmetry complete.
+
+        Params:
+            chan_id = A previously seen pending channel ID provided
+                by the funder node through the call to `openChannel()`
+            peer_nonce = the nonce the calling peer is using for its
+                own signature
+            peer_sig = the signature of the calling peer
+
+        Returns:
+            null, or an error string if the peer could not accept this signature
+
+    ***************************************************************************/
+
+    public string receiveUpdateSig (in Hash chan_id, in uint seq_id,
+        in Point peer_nonce, in Signature peer_sig);
+}
+
 /// Channel configuration. These fields remain static throughout the
 /// lifetime of the channel. All of these fields are public and there
 /// is no risk of sensitive data leakage when handling this struct.
@@ -177,8 +315,8 @@ public class UpdatePair
     /// any previous update containing a lower sequence ID than this one's.
     private Update update;
 
-    /// Settlement which spends from `update`
-    private Settlement settlement;
+    /// Settle which spends from `update`
+    private Settle settlement;
 }
 
 ///
@@ -187,169 +325,130 @@ public class SignTask
     /// Channel configuration
     private const ChannelConfig conf;
 
+    /// Key-pair used for signing and deriving update / settlement key-pairs
+    public const Pair kp;
+
+    /// Task manager to spawn fibers with
+    public SchedulingTaskManager taskman;
+
     /// Peer we're communicating with
     private FlashAPI peer;
 
-    /// Whether we're currently running
-    private bool running;
-
     /// Sequence ID we're trying to sign for
+    /// Todo: we should also have some kind of incremental ID to be able to
+    /// re-try the same sequence IDs
     private uint seq_id;
 
-    /// Pending settlement tx to be signed
-    private Settlement pending_settle;
-
-    /// Pending update tx to be signed after settlement tx is signed
+    /// pending
     private Update pending_update;
+    /// Ditto
+    private Settle pending_settle;
 
     /// Tasks for the various asynchronous API calls
-    private Timer request_settle_task;
+    private ITimer request_task;
     /// Ditto
-    private Timer send_settle_task;
+    private ITimer send_settle_task;
+    /// Ditto
+    private ITimer send_update_task;
 
     /// Called when the settlement & update are signed & validated
     private void delegate (UpdatePair) onComplete;
 
     /// Ctor
-    public this (in ChannelConfig conf, FlashAPI peer)
+    public this (in ChannelConfig conf,  in Pair kp,
+        SchedulingTaskManager taskman, FlashAPI peer)
     {
         this.conf = conf;
+        this.kp = kp;
+        this.taskman = taskman;
         this.peer = peer;
     }
 
-    /// the initiator is either the funder or the receiver of a payment
-    public void run (in uint seq_id, in Transaction update_tx,
-        in Output[] outputs, void delegate (UpdatePair) onComplete)
+    // outputs allready agreed upon!
+    public void run (in uint seq_id, in Output[] outputs,
+        void delegate (UpdatePair) onComplete)
     {
-        assert(!this.running);
         this.clearState();
-
-        this.running = true;
-
         this.seq_id = seq_id;
         this.onComplete = onComplete;
 
-        const our_nonce_kp = Pair.random();
-        this.pending_settle = Settlement(
-            our_nonce_kp,
-            Point.init, // set later when we receive it from the peer
-            update_tx,
-            outputs);
-
-        // todo: need some way of cancelling all tasks related to a stale
-        // sequence ID (sometimes we may wish to restart with the same seq ID)
-        this.request_settle_task = this.taskman.schedule(
+        Update update =
         {
-            if (auto error = this.peer.requestSettleSig(this.conf.chan_id,
-                seq_id, update_tx, outputs, our_nonce_kp.V))
-            {
-                // todo: retry?
-                writefln("Requested settlement rejected: %s", error);
-                assert(0);
-            }
-        });
+            tx : createUpdateTx(this.conf, seq_id),
+        };
+        this.pending_update = update;
+
+        const settle_tx = createSettleTx(update.tx, this.conf.settle_time,
+            outputs);
+        const our_settle_sig = this.signSettle(settle_tx);
+        Settle settle =
+        {
+            our_nonce_kp : Pair.random(),
+            outputs      : outputs.dup,
+            tx           : settle_tx,
+            our_sig      : our_settle_sig,
+        };
+        this.pending_settle = settle;
+
+        // todo: sig should be sent back through requestSettleSig(),
+        // that way we don't have to "wait" for a response, but instead we
+        // keep polling until we get our information
+        auto status = this.peer.requestSettleSig(this.conf.chan_id,
+            seq_id, settle.outputs, settle.our_nonce_kp.V);
+
+        if (status.error !is null)
+        {
+            // todo: retry?
+            writefln("Requested settlement rejected: %s", error);
+            assert(0);
+        }
+
+        if (auto error = this.processSettleSig(status.sig))
+            assert(0, error);
+
+        // now we have our signature, check it and then request update sig
     }
 
-    /// Flash API
-    public string requestSettleSig (in Transaction prev_tx, Output[] outputs,
-        in Point peer_nonce_pk)
+    // todo: check if we agree with the outputs
+    ///
+    public string processSettleSig (Output[] outputs, in Point peer_nonce)
     {
-        if (seq_id != this.seq_id)
-            return "Unexpected sequence ID";
-
-        // todo: should not accept this unless acceptsChannel() was called
         writefln("%s: requestSettleSig(%s)", this.kp.V.prettify,
             this.conf.chan_id.prettify);
 
-        /* todo: verify sequence ID is not an older sequence ID */
-        /* todo: verify prev_tx is not one of our own transactions */
-
-        const our_settle_nonce_kp = Pair.random();
-
-        const settle_tx = createSettleTx(prev_tx, this.conf.settle_time,
+        const our_nonce_kp = Pair.random();
+        const settle_tx = createSettleTx(this.update.tx, this.conf.settle_time,
             outputs);
         const uint input_idx = 0;
-        const challenge_settle = getSequenceChallenge(settle_tx, seq_id,
+        const challenge_settle = getSequenceChallenge(settle_tx, this.seq_id,
             input_idx);
 
         const our_settle_scalar = getSettleScalar(this.kp.v,
-            this.conf.funding_tx_hash, seq_id);
+            this.conf.funding_tx_hash, this.seq_id);
         const settle_pair_pk = getSettlePk(this.conf.pair_pk,
-            this.conf.funding_tx_hash, seq_id, this.conf.num_peers);
-        const nonce_pair_pk = our_settle_nonce_kp.V + peer_nonce_pk;
+            this.conf.funding_tx_hash, this.seq_id, this.conf.num_peers);
+        const nonce_pair_pk = our_nonce_kp.V + peer_nonce;
 
         const sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
-            our_settle_nonce_kp.v, challenge_settle);
+            our_nonce_kp.v, challenge_settle);
 
-        // we also expect the counter-party to give us their signature
-        this.pending_settle = Settlement(
-            seq_id, our_settle_nonce_kp,
-            peer_nonce_pk,
-            Transaction.init,  // trigger tx is revealed later
-            outputs);
-
-        this.send_settle_task = this.taskman.schedule(
-        {
-            if (auto error = this.peer.sendSettleSig(this.conf.chan_id,
-                seq_id, our_settle_nonce_kp.V, sig))
-            {
-                // todo: retry?
-                writefln("Peer rejected settlement tx: %s", error);
-            }
-        });
-
-        return null;
+        return SigResult(null, sig);
     }
 
-    public string sendSettleSig (in Point peer_nonce_pk, in Signature peer_sig)
+    private string verifySettleSig (in Signature sig)
     {
-        if (seq_id != this.seq_id)
-            return "Unexpected sequence ID";
-
-        writefln("%s: sendSettleSig(%s)", this.kp.V.prettify,
-            this.conf.chan_id.prettify);
-
-        auto settle = &this.pending_settle;
-        settle.their_settle_nonce_pk = peer_nonce_pk;
-
-        // recreate the settlement tx
-        auto settle_tx = createSettleTx(settle.prev_tx,
-            this.conf.settle_time, settle.outputs);
-        const uint input_idx = 0;
-        const challenge_settle = getSequenceChallenge(settle_tx, seq_id,
-            input_idx);
-
-        // todo: send the signature back via sendSettleSig()
-        // todo: add pending settlement to the other peer's pending settlements
-
-        // Kim received the <settlement, signature> tuple.
-        // he signs it, and finishes the multisig.
-        Pair our_settle_origin_kp;
-        Point their_settle_origin_pk;
-
-        const our_settle_scalar = getSettleScalar(this.kp.v,
-            this.conf.funding_tx_hash, seq_id);
-        const settle_pair_pk = getSettlePk(this.conf.pair_pk,
-            this.conf.funding_tx_hash, seq_id, this.conf.num_peers);
-        const nonce_pair_pk = settle.our_settle_nonce_kp.V
-            + settle.their_settle_nonce_pk;
-
-        const our_sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
-            settle.our_settle_nonce_kp.v, challenge_settle);
-        settle.our_sig = our_sig;
-
         const settle_sig_pair = Sig(nonce_pair_pk,
               Sig.fromBlob(our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
 
         if (!verify(settle_pair_pk, settle_sig_pair, challenge_settle))
-            return "Settlement signature is invalid";
+            return "Settle signature is invalid";
 
-        writefln("%s: sendSettleSig(%s) VALIDATED for seq id %s",
-            this.kp.V.prettify, this.conf.chan_id.prettify, seq_id);
+        writefln("%s: receiveSettleSig(%s) VALIDATED for seq id %s",
+            this.kp.V.prettify, this.conf.chan_id.prettify, this.seq_id);
 
         // unlock script set
-        const Unlock settle_unlock = createUnlockSettle(settle_sig_pair, seq_id);
+        const Unlock settle_unlock = createUnlockSettle(settle_sig_pair, this.seq_id);
         settle_tx.inputs[0].unlock = settle_unlock;
 
         // note: this step may not look necessary but it can fail if there are
@@ -365,40 +464,91 @@ public class SignTask
             assert(0, error);
         }
 
-        // todo: protect against replay attacks. we do not want an infinite
-        // loop scenario
-        if (this.conf.funder_pk == this.kp.V)
+    }
+
+    private void onSettleComplete ()
+    {
+        this.request_task = this.taskman.schedule(
         {
-            if (seq_id == 0)
-            {
-                auto trigger_tx = settle.prev_tx;
-                const our_trigger_nonce_kp = Pair.random();
+            const our_nonce_kp = Pair.random();
+            this.pending_update = Update(our_nonce_kp);
 
-                this.pending_trigger = Trigger(
-                    our_trigger_nonce_kp,
-                    Point.init,  // set later when we receive it from counter-party
-                    trigger_tx);
-
-                this.request_update_task = this.taskman.schedule(
-                {
-                    if (auto error = this.peer.requestUpdateSig(this.conf.chan_id,
-                        our_trigger_nonce_kp.V, trigger_tx))
-                    {
-                        writefln("Error calling requestUpdateSig(): %s", error);
-                    }
-                });
-            }
-            else
+            if (auto error = this.peer.requestUpdateSig(this.conf.chan_id,
+                this.seq_id, our_nonce_kp.V, prev_tx))
             {
-                // settlement with seq id 1 attaches to update with seq id 1
+                writefln("Error calling requestUpdateSig(): %s", error);
             }
+        });
+    }
+
+    ///
+    public string receiveSettleSig (in Point peer_nonce, in Signature peer_sig)
+    {
+        writefln("%s: receiveSettleSig(%s)", this.kp.V.prettify,
+            this.conf.chan_id.prettify);
+
+        auto settle = &this.pending_settle;
+        settle.peer_nonce = peer_nonce;
+
+        // recreate the settlement tx
+        auto settle_tx = createSettleTx(settle.prev_tx,
+            this.conf.settle_time, settle.outputs);
+        const uint input_idx = 0;
+        const challenge_settle = getSequenceChallenge(settle_tx, this.seq_id,
+            input_idx);
+
+        // todo: send the signature back via receiveSettleSig()
+        // todo: add pending settlement to the other peer's pending settlements
+
+        // Kim received the <settlement, signature> tuple.
+        // he signs it, and finishes the multisig.
+        Pair our_settle_origin_kp;
+        Point peer_settle_origin_pk;
+
+        const our_settle_scalar = getSettleScalar(this.kp.v,
+            this.conf.funding_tx_hash, this.seq_id);
+        const settle_pair_pk = getSettlePk(this.conf.pair_pk,
+            this.conf.funding_tx_hash, this.seq_id, this.conf.num_peers);
+        const nonce_pair_pk = settle.our_nonce_kp.V
+            + settle.peer_nonce;
+
+        const our_sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
+            settle.our_nonce_kp.v, challenge_settle);
+        settle.our_sig = our_sig;
+
+        const settle_sig_pair = Sig(nonce_pair_pk,
+              Sig.fromBlob(our_sig).s
+            + Sig.fromBlob(peer_sig).s).toBlob();
+
+        if (!verify(settle_pair_pk, settle_sig_pair, challenge_settle))
+            return "Settle signature is invalid";
+
+        writefln("%s: receiveSettleSig(%s) VALIDATED for seq id %s",
+            this.kp.V.prettify, this.conf.chan_id.prettify, this.seq_id);
+
+        // unlock script set
+        const Unlock settle_unlock = createUnlockSettle(settle_sig_pair, this.seq_id);
+        settle_tx.inputs[0].unlock = settle_unlock;
+
+        // note: this step may not look necessary but it can fail if there are
+        // any incompatibilities with the script generators and the engine
+        // (e.g. sequence ID being 4 bytes instead of 8)
+        const TestStackMaxTotalSize = 16_384;
+        const TestStackMaxItemSize = 512;
+        scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
+        if (auto error = engine.execute(
+            settle.prev_tx.outputs[0].lock, settle_unlock, settle_tx,
+                settle_tx.inputs[0]))
+        {
+            assert(0, error);
         }
 
         return null;
     }
 
-    public string requestUpdateSig (in Point peer_nonce_pk,
-        Transaction trigger_tx)
+    ///
+    public string requestUpdateSig (in Point peer_nonce,
+        Transaction update_tx)
     {
         writefln("%s: requestUpdateSig(%s)", this.kp.V.prettify,
             this.conf.chan_id.prettify);
@@ -408,100 +558,96 @@ public class SignTask
         // todo: we should just keep the old signatures in case the other
         // node needs it (technically we should just return the latest update tx
         // and the sequence ID)
-        if (this.pending_trigger != Trigger.init)
+        if (this.pending_update != Update.init)
             return "Error: Multiple calls to requestUpdateSig() not supported";
 
         auto settle = &this.pending_settle;
-        if (*settle == Settlement.init)
+        if (*settle == Settle.init)
             return "Pending settlement with this channel ID not found";
 
         // todo: the semantics of the trigger tx need to be validated properly
-        if (trigger_tx.inputs.length == 0)
+        if (update_tx.inputs.length == 0)
             return "Invalid trigger tx";
 
         const funding_utxo = UTXO.getHash(this.conf.funding_tx_hash, 0);
-        if (trigger_tx.inputs[0].utxo != funding_utxo)
-            return "Trigger transaction does not reference the funding tx hash";
+        if (update_tx.inputs[0].utxo != funding_utxo)
+            return "Update transaction does not reference the funding tx hash";
 
-        settle.prev_tx = trigger_tx;
-
-        const our_trigger_nonce_kp = Pair.random();
-
-        const nonce_pair_pk = our_trigger_nonce_kp.V + peer_nonce_pk;
-
+        settle.prev_tx = update_tx;
+        const our_nonce_kp = Pair.random();
+        const nonce_pair_pk = our_nonce_kp.V + peer_nonce;
         const our_sig = sign(this.kp.v, this.conf.pair_pk,
-            nonce_pair_pk, our_trigger_nonce_kp.v, trigger_tx);
+            nonce_pair_pk, our_nonce_kp.v, update_tx);
 
-        this.pending_trigger = Trigger(
-            our_trigger_nonce_kp,
-            peer_nonce_pk,
-            trigger_tx);
+        this.pending_update = Update(
+            our_nonce_kp,
+            peer_nonce,
+            update_tx);
 
         this.send_update_task = this.taskman.schedule(
         {
-            this.peer.sendUpdateSig(this.conf.chan_id, our_trigger_nonce_kp.V,
-                our_sig);
+            this.peer.receiveUpdateSig(this.conf.chan_id, this.seq_id,
+                our_nonce_kp.V, our_sig);
         });
 
         return null;
     }
 
-    public string sendUpdateSig (in Point peer_nonce_pk, in Signature peer_sig)
+    ///
+    public string receiveUpdateSig (in Point peer_nonce, in Signature peer_sig)
     {
-        writefln("%s: sendUpdateSig(%s)", this.kp.V.prettify,
+        writefln("%s: receiveUpdateSig(%s)", this.kp.V.prettify,
             this.conf.chan_id.prettify);
 
-        auto trigger = &this.pending_trigger;
-        if (*trigger == Trigger.init)
-            return "Could not find this pending trigger tx";
+        auto update = &this.pending_update;
+        if (*update == Update.init)
+            return "Could not find this pending update tx";
 
         auto settle = &this.pending_settle;
-        if (*settle == Settlement.init)
+        if (*settle == Settle.init)
             return "Pending settlement with this channel ID not found";
 
-        trigger.their_trigger_nonce_pk = peer_nonce_pk;
-        const nonce_pair_pk = trigger.our_trigger_nonce_kp.V + peer_nonce_pk;
+        update.peer_nonce = peer_nonce;
+        const nonce_pair_pk = update.our_nonce_kp.V + peer_nonce;
 
         const our_sig = sign(this.kp.v, this.conf.pair_pk,
-            nonce_pair_pk, trigger.our_trigger_nonce_kp.v, trigger.tx);
+            nonce_pair_pk, update.our_nonce_kp.v, update.tx);
 
         // verify signature first
-        const trigger_multi_sig = Sig(nonce_pair_pk,
+        const update_multi_sig = Sig(nonce_pair_pk,
               Sig.fromBlob(our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
 
-        const Unlock trigger_unlock = genKeyUnlock(trigger_multi_sig);
-        trigger.tx.inputs[0].unlock = trigger_unlock;
+        const Unlock update_unlock = genKeyUnlock(update_multi_sig);
+        update.tx.inputs[0].unlock = update_unlock;
 
-        // when receiving the trigger transaction only the funder knows
+        // when receiving the update transaction only the funder knows
         // the full funding transaction definition. Therefore the funder
         // should send us a non-signed funding tx here.
         const TestStackMaxTotalSize = 16_384;
         const TestStackMaxItemSize = 512;
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
         if (auto error = engine.execute(
-            this.conf.funding_tx.outputs[0].lock, trigger_unlock,
-            trigger.tx, trigger.tx.inputs[0]))
+            this.conf.funding_tx.outputs[0].lock, update_unlock,
+            update.tx, update.tx.inputs[0]))
         {
             assert(0, error);
         }
 
-        this.trigger = *trigger;
-
-        writefln("%s: sendUpdateSig(%s) VALIDATED", this.kp.V.prettify,
+        writefln("%s: receiveUpdateSig(%s) VALIDATED", this.kp.V.prettify,
             this.conf.chan_id.prettify);
 
         // this prevents infinite loops, we may want to optimize this
         if (this.is_owner)
         {
-            // send the trigger signature
+            // send the update signature
             this.send_update_task = this.taskman.schedule(
             {
-                if (auto error = this.peer.sendUpdateSig(
-                    this.conf.chan_id, trigger.our_trigger_nonce_kp.V,
+                if (auto error = this.peer.receiveUpdateSig(
+                    this.conf.chan_id, update.our_nonce_kp.V,
                     our_sig))
                 {
-                    writefln("Error sending trigger signature back: %s", error);
+                    writefln("Error sending update signature back: %s", error);
                 }
             });
 
@@ -509,9 +655,9 @@ public class SignTask
             const seq_id_0 = 0;
             this.send_settle_task = this.taskman.schedule(
             {
-                if (auto error = this.peer.sendSettleSig(
+                if (auto error = this.peer.receiveSettleSig(
                     this.conf.chan_id, seq_id_0,
-                    settle.our_settle_nonce_kp.V, settle.our_sig))
+                    settle.our_nonce_kp.V, settle.our_sig))
                 {
                     writefln("Error sending settlement signature back: %s", error);
                 }
@@ -533,16 +679,16 @@ public class SignTask
     /// Cancels any existing tasks and clears the state
     public void clearState ()
     {
-        // todo: clear all pending tasks
-        this.running = false;
-        this.pending_settle = Settlement.init;
+        this.pending_settle = Settle.init;
         this.pending_update = Update.init;
 
         // cancel any pending tasks
-        if (this.request_settle_task !is null)
-            this.request_settle_task.stop();
+        if (this.request_task !is null)
+            this.request_task.stop();
         if (this.send_settle_task !is null)
             this.send_settle_task.stop();
+        if (this.send_update_task !is null)
+            this.send_update_task.stop();
     }
 }
 
@@ -587,17 +733,6 @@ public class Channel
     /// The current sequence ID
     private uint cur_seq_id;
 
-    // need it in order to publish to begin closing the channel
-    //private Update pending_update;
-
-    //// all of these must be set before channel is considered opened
-    //private Trigger trigger;
-    //private Settlement last_settlement;
-    //private Update last_update;
-    //private bool funding_externalized;
-
-    private bool started;  // only used by the funder
-
     /// Ctor
     public this (in ChannelConfig conf, in Pair kp, FlashAPI peer,
         SchedulingTaskManager taskman,
@@ -609,27 +744,24 @@ public class Channel
         this.peer = peer;
         this.taskman = taskman;
         this.txPublisher = txPublisher;
-        this.sign_task = new SignTask(this.conf, this.peer);
+        this.sign_task = new SignTask(this.conf, this.kp, this.taskman,
+            this.peer);
     }
 
     /// Start routine for the channel funder
     public void start ()
     {
-        assert(!this.started);  // start() should be called once
         assert(this.is_owner);  // only funder initiates the channel
         assert(this.stage == Stage.Setup);
         assert(this.cur_seq_id == 0);
-        this.started = true;
-
-        // create trigger, don't sign yet but do share it
-        const uint seq_id = 0;
-        const trigger_tx = createUpdateTx(this.conf, seq_id);
 
         // initial output allocates all the funds back to the channel creator
         Output[] outputs = [Output(this.conf.funding_amount,
             PublicKey(this.conf.funder_pk[]))];
 
-        this.sign_task.run(seq_id, trigger_tx, outputs, &this.onSetupComplete);
+        const seq_id = 0;
+        this.sign_task.run(seq_id, this.conf.funding_tx, outputs,
+            &this.onSetupComplete);
     }
 
     ///
@@ -638,8 +770,7 @@ public class Channel
         this.stage = Stage.WaitForFunding;
         this.trigger_pair = update_pair;
 
-        this.funding_tx_signed = this.conf.funding_tx
-            .serializeFull.deserializeFull!Transaction;
+        this.funding_tx_signed = this.conf.funding_tx.clone();
         this.funding_tx_signed.inputs[0].unlock
             = genKeyUnlock(sign(this.kp, this.conf.funding_tx));
 
@@ -650,42 +781,42 @@ public class Channel
 
     ///
     public string requestSettleSig (in uint seq_id, in Transaction prev_tx,
-        Output[] outputs, in Point peer_nonce_pk)
+        Output[] outputs, in Point peer_nonce)
     {
         if (auto error = this.isInvalidSeq(seq_id))
             return error;
 
-        return this.sign_task.requestSettleSig(prev_tx, outputs, peer_nonce_pk);
+        return this.sign_task.requestSettleSig(prev_tx, outputs, peer_nonce);
     }
 
     ///
-    public string sendSettleSig (in uint seq_id, in Point peer_nonce_pk,
+    public string receiveSettleSig (in uint seq_id, in Point peer_nonce,
         in Signature peer_sig)
     {
         if (auto error = this.isInvalidSeq(seq_id))
             return error;
 
-        return this.sign_task.sendSettleSig(peer_nonce_pk, peer_sig);
+        return this.sign_task.receiveSettleSig(peer_nonce, peer_sig);
     }
 
     ///
-    public string requestUpdateSig (in uint seq_id, in Point peer_nonce_pk,
+    public string requestUpdateSig (in uint seq_id, in Point peer_nonce,
         Transaction update_tx)
     {
         if (auto error = this.isInvalidSeq(seq_id))
             return error;
 
-        return this.sign_task.requestUpdateSig(peer_nonce_pk, update_tx);
+        return this.sign_task.requestUpdateSig(peer_nonce, update_tx);
     }
 
     ///
-    public string sendUpdateSig (in uint seq_id, in Point peer_nonce_pk,
+    public string receiveUpdateSig (in uint seq_id, in Point peer_nonce,
         in Signature peer_sig)
     {
         if (auto error = this.isInvalidSeq(seq_id))
             return error;
 
-        return this.sign_task.sendUpdateSig(peer_nonce_pk, peer_sig);
+        return this.sign_task.receiveUpdateSig(peer_nonce, peer_sig);
     }
 
     ///
@@ -701,215 +832,23 @@ public class Channel
 ///
 public struct Update
 {
-    Pair our_update_nonce_kp;
-    Point their_update_nonce_pk;
-    Transaction update_tx;
+    Pair our_nonce_kp;
+    Point peer_nonce;
+    Transaction tx;
 }
 
 ///
-public struct Settlement
+public struct Settle
 {
-    Pair our_settle_nonce_kp;
-    Point their_settle_nonce_pk;
-    Transaction prev_tx;
+    Pair our_nonce_kp;
+    Point peer_nonce;
     Output[] outputs;
 
-    /// 1 of 2 signature that belongs to us. funder needs this so he can
-    /// send it to the peer once the trigger tx is signed and validated.
+    /// Our signature
     Signature our_sig;
-}
 
-/// This is the API that each flash-aware node must implement.
-public interface FlashAPI
-{
-    /***************************************************************************
-
-        Requests opening a channel with this node.
-
-        Params:
-            chan_conf = contains all the static configuration for this channel.
-
-        Returns:
-            null if agreed to open this channel, otherwise an error
-
-    ***************************************************************************/
-
-    public string openChannel (in ChannelConfig chan_conf);
-
-    /***************************************************************************
-
-        Request the peer to sign the trigger transaction, from which the
-        settlement transaction spends.
-
-        The peer should use the agreed-upon update key-pair and the nonce
-        sum of the provided nonce and the peer's own genereated nonce
-        to enable schnorr multisig signatures.
-
-        The peer should then call `sendUpdateSig()` to return their
-        end of the signature. The calling node will then also provide
-        their part of the signature in a call to `sendUpdateSig()`,
-        making the symmetry complete.
-
-        Params:
-            chan_id = A previously seen pending channel ID provided
-                by the funder node through the call to `openChannel()`
-            peer_nonce_pk = the nonce the calling peer is using for its
-                own signature
-            funding_tx = the non-signed funding transaction whose hash
-                the peer will listen for in the blockchain to determine
-                when the channel has opened
-
-        Returns:
-            null, or an error string if the peer could not sign the trigger
-            transaction for whatever reason
-
-    ***************************************************************************/
-
-    public string requestUpdateSig (in Hash chan_id,
-        in Point peer_nonce_pk, Transaction trigger_tx);
-
-    /***************************************************************************
-
-        Return a signature for the trigger transaction for the previously
-        requested one via requestUpdateSig().
-
-        The peer should use the agreed-upon update key-pair and the nonce
-        sum of the provided nonce and the peer's own genereated nonce
-        to enable schnorr multisig signatures.
-
-        The peer should then call `sendUpdateSig()` to return their
-        end of the signature. The calling node will then also provide
-        their part of the signature in a call to `sendUpdateSig()`,
-        making the symmetry complete.
-
-        Params:
-            chan_id = A previously seen pending channel ID provided
-                by the funder node through the call to `openChannel()`
-            peer_nonce_pk = the nonce the calling peer is using for its
-                own signature
-            peer_sig = the signature of the calling peer
-
-        Returns:
-            null, or an error string if the peer could not accept this signature
-
-    ***************************************************************************/
-
-    public string sendUpdateSig (in Hash chan_id,
-        in Point peer_nonce_pk, in Signature peer_sig);
-
-    /***************************************************************************
-
-        Request the peer to create a floating settlement transaction that spends
-        the outputs of the provided previous transaction, and creates the given
-        new outputs and encodes the given signed sequence ID in the
-        unlock script.
-
-        The peer may reject to create such a settlement, for example if the
-        sequence ID is outdated, or if the peer disagrees with the allocation
-        of the funds in the new outputs, or if the outputs try to spend more
-        than the allocated amount.
-
-        Params:
-            chan_id = A previously seen pending channel ID provided
-                by the funder node through the call to `openChannel()`
-            prev_tx = the transaction whose outputs should be spent
-            outputs = the outputs reallocating the funds
-            seq_id = the sequence ID
-            peer_nonce_pk = the nonce the calling peer is using for its
-                own signature
-
-        Returns:
-            null, or an error string if the channel could not be created
-
-    ***************************************************************************/
-
-    public string requestSettleSig (in Hash chan_id,
-        in Transaction prev_tx, Output[] outputs, in uint seq_id,
-        in Point peer_nonce_pk);
-
-    /***************************************************************************
-
-        Provide a settlement transaction that was requested by another peer
-        through the `requestSettleSig()`.
-
-        Note that the settlement transaction itself is not sent back,
-        because the requester already knows what the settlement transaction
-        should look like. Only the signature should be sent back.
-
-        Params:
-            chan_id = A previously seen pending channel ID provided
-                by the funder node through the call to `openChannel()`
-            seq_id = the sequence ID
-            peer_nonce_pk = the nonce the calling peer is using for its
-                own signature
-            peer_sig = the partial signature that needs to be complimented by
-                the second half of the settlement requester
-
-        Returns:
-            null, or an error string if the channel could not be created
-
-    ***************************************************************************/
-
-    public string sendSettleSig (in Hash chan_id, in uint seq_id,
-        in Point peer_nonce_pk, in Signature peer_sig);
-
-    /***************************************************************************
-
-        Request the peer to sign the trigger transaction, from which the
-        settlement transaction spends.
-
-        The peer should use the agreed-upon update key-pair and the nonce
-        sum of the provided nonce and the peer's own genereated nonce
-        to enable schnorr multisig signatures.
-
-        The peer should then call `sendUpdateSig()` to return their
-        end of the signature. The calling node will then also provide
-        their part of the signature in a call to `sendUpdateSig()`,
-        making the symmetry complete.
-
-        Params:
-            chan_id = A previously seen pending channel ID provided
-                by the funder node through the call to `openChannel()`
-            peer_nonce_pk = the nonce the calling peer is using for its
-                own signature
-
-        Returns:
-            null, or an error string if the peer could not sign the trigger
-            transaction for whatever reason
-
-    ***************************************************************************/
-
-    public string requestUpdateSig (in Hash chan_id, in uint seq_id,
-        in Point peer_nonce_pk, Transaction trigger_tx);
-
-    /***************************************************************************
-
-        Return a signature for the trigger transaction for the previously
-        requested one via requestUpdateSig().
-
-        The peer should use the agreed-upon update key-pair and the nonce
-        sum of the provided nonce and the peer's own genereated nonce
-        to enable schnorr multisig signatures.
-
-        The peer should then call `sendUpdateSig()` to return their
-        end of the signature. The calling node will then also provide
-        their part of the signature in a call to `sendUpdateSig()`,
-        making the symmetry complete.
-
-        Params:
-            chan_id = A previously seen pending channel ID provided
-                by the funder node through the call to `openChannel()`
-            peer_nonce_pk = the nonce the calling peer is using for its
-                own signature
-            peer_sig = the signature of the calling peer
-
-        Returns:
-            null, or an error string if the peer could not accept this signature
-
-    ***************************************************************************/
-
-    public string sendUpdateSig (in Hash chan_id, in uint seq_id,
-        in Point peer_nonce_pk, in Signature peer_sig);
+    /// Peer's signature
+    Signature peer_sig;
 }
 
 /// In addition to the Flash API, we provide controller methods to initiate
@@ -929,7 +868,7 @@ public interface ControlAPI : FlashAPI
     public bool readyToExternalize ();
 
     /// ditto
-    public bool channelOpen ();
+    public bool isChannelOpen ();
 }
 
 /// Could be a payer, or a merchant. funds can go either way in the channel.
@@ -993,16 +932,17 @@ public abstract class FlashNode : FlashAPI
         Hash[] pending_chans_to_remove;
         foreach (hash, ref channel; this.channels)
         {
-            if (channel.funding_externalized
-                && channel.last_settlement != Settlement.init
-                && channel.trigger != Trigger.init)
-            {
-                writefln("%s: Channel open(%s)", this.kp.V.prettify,
-                    hash.prettify);
-                //open_channels[channel.conf.funding_tx_hash] = channel;
-                pending_chans_to_remove ~= hash;
-                continue;
-            }
+            // todo
+            //if (channel.funding_externalized
+            //    && channel.last_settlement != Settle.init
+            //    && channel.trigger != Update.init)
+            //{
+            //    writefln("%s: Channel open(%s)", this.kp.V.prettify,
+            //        hash.prettify);
+            //    //open_channels[channel.conf.funding_tx_hash] = channel;
+            //    pending_chans_to_remove ~= hash;
+            //    continue;
+            //}
 
             if (!channel.funding_externalized)
             foreach (tx; last_block.txs)
@@ -1010,8 +950,7 @@ public abstract class FlashNode : FlashAPI
                 if (tx.hashFull() == channel.conf.funding_tx_hash)
                 {
                     if (channel.funding_tx_signed != Transaction.init)
-                        channel.funding_tx_signed
-                            = tx.serializeFull.deserializeFull!Transaction;
+                        channel.funding_tx_signed = tx.clone();
 
                     channel.funding_externalized = true;
                     writefln("%s: Funding tx externalized(%s)",
@@ -1063,63 +1002,49 @@ public abstract class FlashNode : FlashAPI
         return null;
     }
 
-    /// Flash API
+    ///
     public override string requestSettleSig (in Hash chan_id,
-        in Transaction prev_tx, Output[] outputs, in uint seq_id,
-        in Point peer_nonce_pk)
+        in uint seq_id, in Transaction prev_tx, Output[] outputs,
+        in Point peer_nonce)
     {
         if (auto channel = chan_id in this.channels)
-            return channel.requestSettleSig(prev_tx, outputs, seq_id,
-                peer_nonce_pk);
+            return channel.requestSettleSig(prev_tx, seq_id, outputs,
+                peer_nonce);
 
         return "Channel ID not found";
     }
 
-    public override string sendSettleSig (in Hash chan_id,
-        in uint seq_id, in Point peer_nonce_pk, in Signature peer_sig)
+    ///
+    public override string receiveSettleSig (in Hash chan_id,
+        in uint seq_id, in Point peer_nonce, in Signature peer_sig)
     {
         if (auto channel = chan_id in this.channels)
-            return channel.sendSettleSig(seq_id, peer_nonce_pk, peer_sig);
+            return channel.receiveSettleSig(seq_id, peer_nonce, peer_sig);
 
         return "Channel ID not found";
     }
 
+    ///
     public override string requestUpdateSig (in Hash chan_id,
-        in Point peer_nonce_pk, Transaction trigger_tx)
+        in uint seq_id, in Point peer_nonce, Transaction update_tx)
     {
         if (auto channel = chan_id in this.channels)
-            return channel.requestUpdateSig(peer_nonce_pk, trigger_tx);
+            return channel.requestUpdateSig(seq_id, peer_nonce, update_tx);
 
         return "Channel ID not found";
     }
 
-    public override string sendUpdateSig (in Hash chan_id,
-        in Point peer_nonce_pk, in Signature peer_sig)
+    ///
+    public override string receiveUpdateSig (in Hash chan_id,
+        in uint seq_id, in Point peer_nonce, in Signature peer_sig)
     {
         if (auto channel = chan_id in this.channels)
-            return channel.sendUpdateSig(peer_nonce_pk, peer_sig);
+            return channel.receiveUpdateSig(seq_id, peer_nonce, peer_sig);
 
         return "Channel ID not found";
     }
 
-    public override string requestUpdateSig (in Hash chan_id,
-        in uint seq_id, in Point peer_nonce_pk, Transaction update_tx)
-    {
-        if (auto channel = chan_id in this.channels)
-            return channel.requestUpdateSig(seq_id, peer_nonce_pk, update_tx);
-
-        return "Channel ID not found";
-    }
-
-    public override string sendUpdateSig (in Hash chan_id,
-        in uint seq_id, in Point peer_nonce_pk, in Signature peer_sig)
-    {
-        if (auto channel = chan_id in this.channels)
-            return channel.sendUpdateSig(seq_id, peer_nonce_pk, peer_sig);
-
-        return "Channel ID not found";
-    }
-
+    ///
     private FlashAPI getFlashClient (in Point peer_pk)
     {
         auto tid = this.flash_registry.locate(peer_pk.to!string);
@@ -1202,7 +1127,7 @@ public class ControlFlashNode : FlashNode, ControlAPI
 
         //this.peerrequestSettlementSig (in Hash chan_id,
         //    in Transaction prev_tx, Output[] outputs, in uint seq_id,
-        //    in Point peer_nonce_pk)
+        //    in Point peer_nonce)
     }
 
     /// convenience
@@ -1212,7 +1137,7 @@ public class ControlFlashNode : FlashNode, ControlAPI
     }
 
     /// ditto
-    public override bool channelOpen ()
+    public override bool isChannelOpen ()
     {
         //return this.open_channels.length > 0;
         return false;
@@ -1490,10 +1415,16 @@ public Point getSettlePk (in Point origin, in Hash utxo, in ulong seq_id,
 private class SchedulingTaskManager : LocalRestTaskManager
 {
     /// Ditto
-    public Timer schedule (void delegate() dg) nothrow
+    public ITimer schedule (void delegate() dg) nothrow
     {
         return super.setTimer(0.seconds, dg);
     }
+}
+
+/// utility
+private T clone (T)(in T input)
+{
+    return input.serializeFull.deserializeFull!T;
 }
 
 /// Ditto
@@ -1554,7 +1485,7 @@ unittest
     txs.each!(tx => node_1.putTransaction(tx));
     network.expectBlock(Height(2), network.blocks[0].header);
 
-    //while (!alice.channelOpen())
+    //while (!alice.isChannelOpen())
     //{
     //    // there should be an infinite loop here which keeps creating txs
     //    Thread.sleep(100.msecs);
