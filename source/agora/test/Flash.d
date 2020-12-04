@@ -104,6 +104,10 @@ alias LockType = agora.script.Lock.LockType;
 
 // todo: make the channel ID a const struct?
 
+// todo: could make the output lock on the funding tx to be a redeem script,
+// that way we could potentially close a channel in only 2 transactions
+// instead of 3, if we do it cooperatively!
+
 public struct OpenResult
 {
     string error;  // in case rejected
@@ -824,6 +828,8 @@ public interface ControlAPI : FlashAPI
     public void ctrlUpdateBalance (in Hash chan_id, in Amount funder,
         in Amount peer);
 
+    public void ctrlCloseChannel (in Hash chan_id);
+
     /// convenience
     public bool readyToExternalize ();
 
@@ -853,6 +859,8 @@ public abstract class FlashNode : FlashAPI
     private Channel[Hash] channels;
 
     private bool ready_to_externalize;
+
+    private bool ready_to_close;
 
     /// Ctor
     public this (const Pair kp, Registry* agora_registry,
@@ -1072,9 +1080,16 @@ public class ControlFlashNode : FlashNode, ControlAPI
     }
 
     /// Control API
+    public override void ctrlCloseChannel (in Hash chan_id)
+    {
+
+    }
+
+    /// Control API
     public override void ctrlUpdateBalance (in Hash chan_id,
         in Amount funder_amount, in Amount peer_amount)
     {
+        in Amount funder_amount, in Amount peer_amount)
         writefln("%s: ctrlUpdateBalance(%s, %s, %s)", this.kp.V.prettify,
             chan_id.prettify, funder_amount, peer_amount);
 
@@ -1112,6 +1127,12 @@ public class ControlFlashNode : FlashNode, ControlAPI
     public override bool readyToExternalize ()
     {
         return this.ready_to_externalize;
+    }
+
+    /// convenience
+    public override bool readyToClose ()
+    {
+        return this.ready_to_close;
     }
 
     /// ditto
@@ -1493,6 +1514,21 @@ unittest
     }
 
     alice.ctrlUpdateBalance(chan_id, Amount(10_000), Amount(5_000));
+    alice.ctrlCloseChannel(chan_id);
+
+    while (!alice.readyToClose())
+    {
+        // there should be an infinite loop here which keeps creating txs
+        Thread.sleep(100.msecs);
+    }
+
+    // now we create a new one
+    txs = txs.map!(tx => TxBuilder(tx, 0))
+        .enumerate()
+        .map!(en => en.value.refund(WK.Keys[en.index].address).sign())
+        .array();
+    txs.each!(tx => node_1.putTransaction(tx));
+    network.expectBlock(Height(2), network.blocks[0].header);
 
     Thread.sleep(1.seconds);
 }
