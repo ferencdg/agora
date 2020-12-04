@@ -357,8 +357,8 @@ public class SignTask
             assert(0);
         }
 
-        if (auto error = this.isInvalidSettleMultiSig(
-            this.pending_settle, status.sig))
+        if (auto error = this.isInvalidSettleMultiSig(this.pending_settle,
+            status.sig))
         {
             // todo: inform? ban?
             writefln("Error during validation: %s For settle signature: %s",
@@ -371,8 +371,7 @@ public class SignTask
         // here it's a bit problematic because the counter-party will refuse
         // to reveal their update sig until they receive the settlement signature
         // todo: could we just share it in the single request API?
-        status = this.peer.requestUpdateSig(this.conf.chan_id,
-            seq_id);
+        status = this.peer.requestUpdateSig(this.conf.chan_id, seq_id);
         if (status.error !is null)
         {
             // todo: retry?
@@ -380,8 +379,8 @@ public class SignTask
             assert(0);
         }
 
-        if (auto error = this.isInvalidUpdateMultiSig(
-            this.pending_update, status.sig))
+        if (auto error = this.isInvalidUpdateMultiSig(this.pending_update,
+            status.sig))
         {
             // todo: inform? ban?
             writefln("Error during validation: %s For update signature: %s",
