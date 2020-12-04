@@ -474,10 +474,12 @@ public class SignTask
               Sig.fromBlob(settle.our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
 
+        Transaction settle_tx
+            = settle.tx.serializeFull().deserializeFull!Transaction;
+
         const Unlock settle_unlock = createUnlockSettle(settle_multi_sig,
             this.seq_id);
-        Input input = settle.tx.inputs[0].serializeFull().deserializeFull!Input;
-        input.unlock = settle_unlock;
+        settle_tx.inputs[0].unlock = settle_unlock;
 
         // note: must always use the execution engine to validate and never
         // try to validate the signatures manually.
@@ -485,8 +487,35 @@ public class SignTask
         const TestStackMaxItemSize = 512;
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
         if (auto error = engine.execute(
-            this.pending_update.tx.outputs[0].lock, settle_unlock, settle.tx,
-            input))
+            this.pending_update.tx.outputs[0].lock, settle_tx.inputs[0].unlock,
+            settle_tx, input))
+            return error;
+
+        return null;
+    }
+
+    private string isInvalidUpdateMultiSig (in PendingUpdate update,
+        in Signature peer_sig)
+    {
+        const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
+        const update_multi_sig = Sig(nonce_pair_pk,
+              Sig.fromBlob(update.our_sig).s
+            + Sig.fromBlob(peer_sig).s).toBlob();
+
+        Transaction update_tx
+            = update.tx.serializeFull().deserializeFull!Transaction;
+
+        const Unlock update_unlock = this.getUpdateUnlock(update_multi_sig);
+        update_tx.inputs[0].unlock = update_unlock;
+        const lock = this.getUpdateLock();
+
+        // note: must always use the execution engine to validate and never
+        // try to validate the signatures manually.
+        const TestStackMaxTotalSize = 16_384;
+        const TestStackMaxItemSize = 512;
+        scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
+        if (auto error = engine.execute(lock, update_tx.inputs[0].unlock,
+            update_tx, input))
             return error;
 
         return null;
@@ -518,33 +547,6 @@ public class SignTask
                 this.conf.funding_tx_hash, this.conf.pair_pk, prev_seq,
                 this.conf.num_peers);
         }
-    }
-
-    private string isInvalidUpdateMultiSig (in PendingUpdate update,
-        in Signature peer_sig)
-    {
-        const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
-        const update_multi_sig = Sig(nonce_pair_pk,
-              Sig.fromBlob(update.our_sig).s
-            + Sig.fromBlob(peer_sig).s).toBlob();
-
-        const Unlock update_unlock = this.getUpdateUnlock(update_multi_sig);
-        Input input = update.tx.inputs[0].serializeFull().deserializeFull!Input;
-        input.unlock = update_unlock;
-        const lock = this.getUpdateLock();
-
-        // todo: should not be hardcoded to idx 0
-        //update.tx.inputs[0].unlock = update_unlock;
-
-        // note: must always use the execution engine to validate and never
-        // try to validate the signatures manually.
-        const TestStackMaxTotalSize = 16_384;
-        const TestStackMaxItemSize = 512;
-        scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
-        if (auto error = engine.execute(lock, update_unlock, update.tx, input))
-            return error;
-
-        return null;
     }
 
     ///
