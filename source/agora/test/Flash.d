@@ -37,6 +37,7 @@ import geod24.Registry;
 
 import libsodium.randombytes;
 
+import std.algorithm;
 import std.bitmanip;
 import std.container.dlist;
 import std.conv;
@@ -101,6 +102,8 @@ alias LockType = agora.script.Lock.LockType;
 // time. how does C-LN handle this? Maybe the sequence ID should be part of
 // the invoice, and only one can cooperatively be accepted.
 
+// todo: make the channel ID a const struct?
+
 public struct OpenResult
 {
     string error;  // in case rejected
@@ -111,6 +114,29 @@ public struct SigResult
 {
     string error;  // in case rejected
     Signature sig;
+}
+
+public struct Balance
+{
+    Output[] outputs;
+}
+
+public struct BalanceRequest
+{
+    Balance balance;
+    PublicNonce peer_nonce;
+}
+
+public struct BalanceResult
+{
+    string error;  // in case rejected
+    PublicNonce peer_nonce;
+}
+
+public struct ChannelStatus
+{
+    string error;
+    Hash chan_id;
 }
 
 /// This is the API that each flash-aware node must implement.
@@ -130,6 +156,21 @@ public interface FlashAPI
 
     public OpenResult openChannel (in ChannelConfig chan_conf,
         PublicNonce peer_nonce);
+
+    /***************************************************************************
+
+        Requests opening a channel with this node.
+
+        Params:
+            chan_conf = contains all the static configuration for this channel.
+
+        Returns:
+            null if agreed to open this channel, otherwise an error
+
+    ***************************************************************************/
+
+    public BalanceResult requestUpdateBalance (in Hash chan_id, in uint seq_id,
+        in BalanceRequest balance_req);
 
     /***************************************************************************
 
@@ -237,15 +278,15 @@ public struct ChannelConfig
     public alias chan_id = funding_tx_hash;
 }
 
-/// Tracks the current stage of the channel.
-/// Stages can only move forwards, and never back.
-public enum Stage
+/// Tracks the current state of the channel.
+/// States can only move forwards, and never back.
+public enum State
 {
-    /// Cooperating on the initial trigger and settlement txs
+    /// Cooperating on the initial trigger and settlement txs.
     Setup,
 
-    /// Waiting for the funding tx to appear in the blockchain
-    WaitForFunding,
+    /// Waiting for the funding tx to appear in the blockchain.
+    WaitingForFunding,
 
     /// The channel is open.
     Open,
@@ -287,9 +328,6 @@ public class SignTask
     /// Todo: we should also have some kind of incremental ID to be able to
     /// re-try the same sequence IDs
     private uint seq_id;
-
-    /// The new balances we're trying to sign
-    private Output[] balances;
 
     /// The private nonce we'll use for this signing session
     private PrivateNonce priv_nonce;
@@ -333,19 +371,19 @@ public class SignTask
         this.peer = peer;
     }
 
-    // balances allready agreed upon!
+    // balance allready agreed upon!
     // todo: this can be a blocking call
-    public UpdatePair run (in uint seq_id, Output[] balances,
+    public UpdatePair run (in uint seq_id, in Balance balance,
         PrivateNonce priv_nonce, PublicNonce peer_nonce)
     {
         this.clearState();
         this.seq_id = seq_id;
-        this.balances = balances;
         this.priv_nonce = priv_nonce;
         this.peer_nonce = peer_nonce;
 
         this.pending_update = this.createPendingUpdate();
-        this.pending_settle = this.createPendingSettle(this.pending_update.tx);
+        this.pending_settle = this.createPendingSettle(this.pending_update.tx,
+            balance);
 
         auto status = this.peer.requestSettleSig(this.conf.chan_id,
             seq_id);
@@ -445,7 +483,8 @@ public class SignTask
         return update;
     }
 
-    private PendingSettle createPendingSettle (in Transaction update_tx)
+    private PendingSettle createPendingSettle (in Transaction update_tx,
+        in Balance balance)
     {
         const settle_key = getSettleScalar(this.kp.v, this.conf.funding_tx_hash,
             this.seq_id);
@@ -455,7 +494,7 @@ public class SignTask
 
         const uint input_idx = 0;  // this should ideally not be hardcoded
         auto settle_tx = createSettleTx(update_tx, this.conf.settle_time,
-            this.balances);
+            balance.outputs);
         const challenge_settle = getSequenceChallenge(settle_tx, this.seq_id,
             input_idx);
 
@@ -599,7 +638,7 @@ struct PrivateNonce
     Pair update;
 }
 
-public struct PublicNonce
+struct PublicNonce
 {
     Point settle;
     Point update;
@@ -630,8 +669,8 @@ public class Channel
     /// For peers they receive this from the blockchain.
     public Transaction funding_tx_signed;
 
-    /// Current stage of the channel
-    private Stage stage;
+    /// Current state of the channel
+    private State state;
 
     /// The signer for an update / settle pair
     private SignTask sign_task;
@@ -642,8 +681,9 @@ public class Channel
     /// The current sequence ID
     private uint cur_seq_id;
 
-    /// The balances we're trying to sign for the current sequence ID
-    private Output[] balances;
+    /// The current balance of the channel. Initially empty until the
+    /// funding tx is externalized.
+    private Balance cur_balance;
 
     /// Our private nonces for the current signing phase
     private PrivateNonce priv_nonce;
@@ -666,49 +706,57 @@ public class Channel
         this.txPublisher = txPublisher;
         this.sign_task = new SignTask(this.conf, this.kp, this.taskman,
             this.peer);
-        // initial output allocates all the funds back to the channel creator
-        this.balances = [Output(this.conf.funding_amount,
-            PublicKey(this.conf.funder_pk[]))];
+    }
+
+    ///
+    public bool isWaitingForFunding ()
+    {
+        return this.state == State.WaitingForFunding;
+    }
+
+    ///
+    public bool isOpen ()
+    {
+        return this.state == State.Open;
     }
 
     /// Start routine for the channel
     public void start ()
     {
-        assert(this.stage == Stage.Setup);
+        assert(this.state == State.Setup);
         assert(this.cur_seq_id == 0);
 
+        // initial output allocates all the funds back to the channel creator
         const seq_id = 0;
-
-        auto pair = this.sign_task.run(seq_id, this.balances, this.priv_nonce,
+        auto balance = Balance([Output(this.conf.funding_amount,
+            PublicKey(this.conf.funder_pk[]))]);
+        auto pair = this.sign_task.run(seq_id, balance, this.priv_nonce,
             this.peer_nonce);
         this.onSetupComplete(pair);
     }
 
-    public bool waitingForFunding ()
-    {
-        return this.stage == Stage.WaitForFunding;
-    }
-
     public void fundingExternalized (in Transaction tx)
     {
-        // this is not technically an error, but it would be very strange
-        // that a funding tx was published before signing was complete.
-        // in this case we may want to just store the funding tx here
-        // and then automatically jump a stage
         this.funding_tx_signed = tx.serializeFull.deserializeFull!Transaction;
+        if (this.state == State.WaitingForFunding)
+            this.state = State.Open;
 
-        if (this.stage == Stage.WaitForFunding)
-            this.stage = Stage.Open;
+        // todo: assert that this is really the actual balance
+        this.cur_balance = Balance([Output(this.conf.funding_amount,
+            PublicKey(this.conf.funder_pk[]))]);
     }
 
     ///
     private void onSetupComplete (UpdatePair update_pair)
     {
-        // funder already published the funding tx for whatever reason
+        // this is not technically an error, but it would be very strange
+        // that a funding tx was published before signing was complete,
+        // as the funding party carries the risk of having their funds locked.
+        // in this case we skip straight to the open state.
         if (this.funding_tx_signed != Transaction.init)
-            this.stage = Stage.Open;
+            this.state = State.Open;
         else
-            this.stage = Stage.WaitForFunding;
+            this.state = State.WaitingForFunding;
 
         // if we're the funder then it's time to publish the funding tx
         if (this.is_owner)
@@ -743,6 +791,24 @@ public class Channel
     }
 
     ///
+    public void signUpdate (in uint seq_id, PrivateNonce priv_nonce,
+        PublicNonce peer_nonce, in Balance new_balance)
+    {
+        assert(this.state == State.Open);
+        assert(seq_id == this.cur_seq_id + 1);
+
+        this.cur_seq_id++;
+        this.priv_nonce = priv_nonce;
+        this.peer_nonce = peer_nonce;
+        auto update_pair = this.sign_task.run(this.cur_seq_id, new_balance,
+            this.priv_nonce, this.peer_nonce);
+
+        this.sign_task.clearState();
+        this.channel_updates ~= update_pair;
+        this.cur_balance.outputs = new_balance.outputs.dup;
+    }
+
+    ///
     private string isInvalidSeq (in uint seq_id)
     {
         if (seq_id != this.cur_seq_id)
@@ -760,16 +826,17 @@ public interface ControlAPI : FlashAPI
     public void prepare ();
 
     /// Open a channel with another flash node.
-    public string ctrlOpenChannel (in Hash funding_hash,
-        in Amount funding_amount, in uint settle_time, in Point peer_pk);
+    public Hash ctrlOpenChannel (in Hash funding_hash, in Amount funding_amount,
+        in uint settle_time, in Point peer_pk);
 
-    public void sendFlash (in Amount amount);
+    public void ctrlUpdateBalance (in Hash chan_id, in Amount funder,
+        in Amount peer);
 
     /// convenience
     public bool readyToExternalize ();
 
     /// ditto
-    public bool isChannelOpen ();
+    public bool anyChannelOpen ();
 }
 
 /// Could be a payer, or a merchant. funds can go either way in the channel.
@@ -842,17 +909,9 @@ public abstract class FlashNode : FlashAPI
             chan_conf.settle_time > max_settle_time)
             return OpenResult("Settle time is not within acceptable limits");
 
-        PrivateNonce priv_nonce =
-        {
-            settle : Pair.random(),
-            update : Pair.random(),
-        };
-
-        PublicNonce pub_nonce =
-        {
-            settle : priv_nonce.settle.V,
-            update : priv_nonce.update.V,
-        };
+        // todo: move this into start()
+        PrivateNonce priv_nonce = genPrivateNonce();
+        PublicNonce pub_nonce = priv_nonce.getPublicNonce();
 
         auto channel = new Channel(chan_conf, this.kp, priv_nonce, peer_nonce,
             peer, this.taskman, &this.txPublisher);
@@ -885,6 +944,34 @@ public abstract class FlashNode : FlashAPI
     }
 
     ///
+    public override BalanceResult requestUpdateBalance (in Hash chan_id,
+        in uint seq_id, in BalanceRequest balance_req)
+    {
+        auto channel = chan_id in this.channels;
+        if (channel is null)
+            return BalanceResult("Channel ID not found");
+
+        if (!channel.isOpen())
+            return BalanceResult("This channel is not funded yet");
+
+        // todo: need to add sequence ID verification here
+        // todo: add logic if we agree with the new balance
+        // todo: check sums for the balance so it doesn't exceed
+        // the channel balance, and that it matches exactly.
+
+        PrivateNonce priv_nonce = genPrivateNonce();
+        PublicNonce pub_nonce = priv_nonce.getPublicNonce();
+
+        this.taskman.schedule(
+        {
+            channel.signUpdate(seq_id, priv_nonce, balance_req.peer_nonce,
+                balance_req.balance);
+        });
+
+        return BalanceResult(null, pub_nonce);
+    }
+
+    ///
     private FlashAPI getFlashClient (in Point peer_pk)
     {
         auto tid = this.flash_registry.locate(peer_pk.to!string);
@@ -909,7 +996,7 @@ public abstract class FlashNode : FlashAPI
         Hash[] pending_chans_to_remove;
         foreach (hash, ref channel; this.channels)
         {
-            if (!channel.waitingForFunding())
+            if (!channel.isWaitingForFunding())
                 continue;
 
             foreach (tx; last_block.txs)
@@ -944,7 +1031,7 @@ public class ControlFlashNode : FlashNode, ControlAPI
     }
 
     /// Control API
-    public override string ctrlOpenChannel (in Hash funding_utxo,
+    public override Hash ctrlOpenChannel (in Hash funding_utxo,
         in Amount funding_amount, in uint settle_time, in Point peer_pk)
     {
         writefln("%s: ctrlOpenChannel(%s, %s, %s)", this.kp.V.prettify,
@@ -975,48 +1062,55 @@ public class ControlFlashNode : FlashNode, ControlAPI
             settle_time     : settle_time,
         };
 
-        PrivateNonce priv_nonce =
-        {
-            settle : Pair.random(),
-            update : Pair.random(),
-        };
-
-        PublicNonce pub_nonce =
-        {
-            settle : priv_nonce.settle.V,
-            update : priv_nonce.update.V,
-        };
+        PrivateNonce priv_nonce = genPrivateNonce();
+        PublicNonce pub_nonce = priv_nonce.getPublicNonce();
 
         auto status = peer.openChannel(chan_conf, pub_nonce);
-        if (status.error.length > 0)
-        {
-            writefln("Peer rejected openChannel() request: %s", status.error);
-            return status.error;
-        }
+        assert(status.error is null, status.error);
 
         auto channel = new Channel(chan_conf, this.kp, priv_nonce,
             status.peer_nonce, peer, this.taskman, &this.txPublisher);
         this.channels[chan_id] = channel;
         channel.start();
 
-        return null;
+        return chan_id;
     }
 
-    public void sendFlash (in Amount amount)
+    /// Control API
+    public override void ctrlUpdateBalance (in Hash chan_id,
+        in Amount funder_amount, in Amount peer_amount)
     {
-        writefln("%s: sendFlash()", this.kp.V.prettify);
+        writefln("%s: ctrlUpdateBalance(%s, %s, %s)", this.kp.V.prettify,
+            chan_id, funder_amount, peer_amount);
 
-        //// todo: use actual channel IDs, or perhaps an invoice API
-        //auto channel = this.open_channels[this.open_channels.byKey.front];
+        auto channel = chan_id in this.channels;
+        assert(channel !is null);
 
-        //auto update_tx = this.createUpdateTx(channel.update_pair_pk,
-        //    channel.trigger.tx,
-        //    channel.funding_amount, channel.settle_time,
-        //    channel.settle_origin_pair_pk);
+        // todo: we need to track this somewhere else
+        static uint seq_id = 0;
+        ++seq_id;
 
-        //this.peerrequestSettlementSig (in Hash chan_id,
-        //    in Transaction prev_tx, Output[] outputs, in uint seq_id,
-        //    in Point peer_nonce)
+        PrivateNonce priv_nonce = genPrivateNonce();
+        PublicNonce pub_nonce = priv_nonce.getPublicNonce();
+
+        const Balance balance = Balance(
+            [Output(funder_amount, PublicKey(channel.conf.funder_pk[])),
+             Output(peer_amount, PublicKey(channel.conf.peer_pk[]))]);
+
+        const BalanceRequest balance_req =
+        {
+            balance    : balance,
+            peer_nonce : pub_nonce,
+        };
+
+        auto status = channel.peer.requestUpdateBalance(chan_id, seq_id,
+            balance_req);
+        assert(status.error is null, status.error);
+
+        this.taskman.schedule(
+        {
+            channel.signUpdate(seq_id, priv_nonce, status.peer_nonce, balance);
+        });
     }
 
     /// convenience
@@ -1026,10 +1120,9 @@ public class ControlFlashNode : FlashNode, ControlAPI
     }
 
     /// ditto
-    public override bool isChannelOpen ()
+    public override bool anyChannelOpen ()
     {
-        //return this.open_channels.length > 0;
-        return false;
+        return this.channels.byValue.any!(chan => chan.isOpen());
     }
 }
 
@@ -1316,6 +1409,28 @@ private T clone (T)(in T input)
     return input.serializeFull.deserializeFull!T;
 }
 
+private PrivateNonce genPrivateNonce ()
+{
+    PrivateNonce priv_nonce =
+    {
+        settle : Pair.random(),
+        update : Pair.random(),
+    };
+
+    return priv_nonce;
+}
+
+private PublicNonce getPublicNonce (in PrivateNonce priv_nonce)
+{
+    PublicNonce pub_nonce =
+    {
+        settle : priv_nonce.settle.V,
+        update : priv_nonce.update.V,
+    };
+
+    return pub_nonce;
+}
+
 /// Ditto
 unittest
 {
@@ -1358,7 +1473,9 @@ unittest
 
     // the utxo the funding tx will spend (only really important for the funder)
     const utxo = UTXO.getHash(hashFull(txs[0]), 0);
-    alice.ctrlOpenChannel(utxo, Amount(10_000), Settle_10_Blocks, bob_pair.V);
+
+    const chan_id = alice.ctrlOpenChannel(
+        utxo, Amount(10_000), Settle_10_Blocks, bob_pair.V);
 
     while (!alice.readyToExternalize())
     {
@@ -1366,7 +1483,7 @@ unittest
         Thread.sleep(100.msecs);
     }
 
-    // one of these txs will be a double-spend
+    // one of these txs will be a double-spend but it's ok
     txs = txs.map!(tx => TxBuilder(tx, 0))
         .enumerate()
         .map!(en => en.value.refund(WK.Keys[en.index].address).sign())
@@ -1374,13 +1491,13 @@ unittest
     txs.each!(tx => node_1.putTransaction(tx));
     network.expectBlock(Height(2), network.blocks[0].header);
 
-    //while (!alice.isChannelOpen())
-    //{
-    //    // there should be an infinite loop here which keeps creating txs
-    //    Thread.sleep(100.msecs);
-    //}
+    while (!alice.anyChannelOpen())
+    {
+        // there should be an infinite loop here which keeps creating txs
+        Thread.sleep(100.msecs);
+    }
 
-    //alice.sendFlash(Amount(10_000));
+    alice.ctrlUpdateBalance(chan_id, Amount(10_000), Amount(5_000));
 
     Thread.sleep(1.seconds);
 }
