@@ -151,8 +151,7 @@ public interface FlashAPI
     ***************************************************************************/
 
     public SigResult requestSettleSig (in Hash chan_id,
-        in uint seq_id, in Transaction prev_tx, Output[] outputs,
-        in Point peer_nonce);
+        in uint seq_id, Output[] outputs, in Point peer_nonce);
 
     /***************************************************************************
 
@@ -404,6 +403,44 @@ public class SignTask
             assert(0, error);
 
         // now we have our signature, check it and then request update sig
+    }
+
+    public SigResult requestSettleSig (Output[] outputs, in Point peer_nonce)
+    {
+        const our_settle_nonce_kp = Pair.random();
+
+        const settle_tx = createSettleTx(prev_tx, this.conf.settle_time,
+            outputs);
+        const uint input_idx = 0;
+        const challenge_settle = getSequenceChallenge(settle_tx, seq_id,
+            input_idx);
+
+        const our_settle_scalar = getSettleScalar(this.kp.v, this.conf.funding_tx_hash,
+            seq_id);
+        const settle_pair_pk = getSettlePk(this.conf.pair_pk, this.conf.funding_tx_hash,
+            seq_id, this.conf.num_peers);
+        const nonce_pair_pk = our_settle_nonce_kp.V + peer_nonce_pk;
+
+        const sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
+            our_settle_nonce_kp.v, challenge_settle);
+
+        // we also expect the counter-party to give us their signature
+        this.pending_settlement = Settlement(
+            this.conf.chan_id, seq_id, our_settle_nonce_kp,
+            peer_nonce_pk,
+            Transaction.init,  // trigger tx is revealed later
+            outputs);
+
+        this.taskman.schedule(
+        {
+            if (auto error = this.peer.receiveSettlementSig(this.conf.chan_id,
+                seq_id, our_settle_nonce_kp.V, sig))
+            {
+                // todo: retry?
+                writefln("Peer rejected settlement tx: %s", error);
+            }
+        });
+
     }
 
     // todo: check if we agree with the outputs
@@ -777,13 +814,13 @@ public class Channel
     }
 
     ///
-    public string requestSettleSig (in uint seq_id, in Transaction prev_tx,
-        Output[] outputs, in Point peer_nonce)
+    public string requestSettleSig (in uint seq_id, Output[] outputs,
+        in Point peer_nonce)
     {
         if (auto error = this.isInvalidSeq(seq_id))
             return error;
 
-        return this.sign_task.requestSettleSig(prev_tx, outputs, peer_nonce);
+        return this.sign_task.requestSettleSig(outputs, peer_nonce);
     }
 
     ///
