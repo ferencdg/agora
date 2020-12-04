@@ -104,10 +104,8 @@ alias LockType = agora.script.Lock.LockType;
 
 // todo: make the channel ID a const struct?
 
-// todo: could make the output lock on the funding tx to be a redeem script,
-// that way we could potentially close a channel in only 2 transactions
-// instead of 3, if we do it cooperatively!
-
+// todo: create an example where we use a new update attaching to a settlement
+// which immediately refunds everyone. This is a cooperative closing of a channel.
 public struct OpenResult
 {
     string error;  // in case rejected
@@ -914,11 +912,15 @@ public abstract class FlashNode : FlashAPI
         if (chan_conf.funding_amount < min_funding)
             return OpenResult("Funding amount is too low");
 
-        const min_settle_time = 5;
-        const max_settle_time = 10;
-        if (chan_conf.settle_time < min_settle_time ||
-            chan_conf.settle_time > max_settle_time)
-            return OpenResult("Settle time is not within acceptable limits");
+        // todo: re-enable
+        version (none)
+        {
+            const min_settle_time = 5;
+            const max_settle_time = 10;
+            if (chan_conf.settle_time < min_settle_time ||
+                chan_conf.settle_time > max_settle_time)
+                return OpenResult("Settle time is not within acceptable limits");
+        }
 
         // todo: move this into start()
         PrivateNonce priv_nonce = genPrivateNonce();
@@ -1487,13 +1489,14 @@ unittest
     auto bob = factory.create(bob_pair, address);
 
     // 10 blocks settle time after / when trigger tx is published
-    const Settle_10_Blocks = 10;
+    const Settle_1_Blocks = 0;
+    //const Settle_10_Blocks = 10;
 
     // the utxo the funding tx will spend (only really important for the funder)
     const utxo = UTXO.getHash(hashFull(txs[0]), 0);
 
     const chan_id = alice.ctrlOpenChannel(
-        utxo, Amount(10_000), Settle_10_Blocks, bob_pair.V);
+        utxo, Amount(10_000), Settle_1_Blocks, bob_pair.V);
 
     while (!alice.readyToExternalize())
     {
@@ -1543,18 +1546,19 @@ unittest
     txs.each!(tx => node_1.putTransaction(tx));
     network.expectBlock(Height(3), network.blocks[0].header);
 
-    //const block_3 = node_1.getBlocksFrom(0, 1024)[$ - 1];
-    //txs = filtSpendable!(tx => tx.hashFull() != funding_tx_hash)(block_3)
-    //    .enumerate()
-    //    .map!(en => en.value.refund(WK.Keys[3].address).sign())
-    //    .take(7)
-    //    .array();
-    //txs ~= update_pair.settle_tx;
+    const block_3 = node_1.getBlocksFrom(0, 1024)[$ - 1];
+    txs = filtSpendable!(tx => tx.hashFull() != update_pair.update_tx.hashFull())(block_3)
+        .enumerate()
+        .map!(en => en.value.refund(WK.Keys[3].address).sign())
+        .take(7)
+        .array();
+    writefln("Posting settle tx: %s", update_pair.settle_tx.hashFull());
+    txs ~= update_pair.settle_tx;
 
-    //txs.each!(tx => node_1.putTransaction(tx));
-    //network.expectBlock(Height(4), network.blocks[0].header);
+    txs.each!(tx => node_1.putTransaction(tx));
+    network.expectBlock(Height(4), network.blocks[0].header);
 
-    //Thread.sleep(1.seconds);
+    Thread.sleep(1.seconds);
 }
 
 import agora.consensus.data.Block;
