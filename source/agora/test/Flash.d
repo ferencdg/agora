@@ -104,8 +104,7 @@ alias LockType = agora.script.Lock.LockType;
 public struct OpenResult
 {
     string error;  // in case rejected
-    Point settle_nonce;
-    Point update_nonce;
+    PublicNonce peer_nonce;
 }
 
 public struct SigResult
@@ -353,7 +352,7 @@ public class SignTask
         if (status.error !is null)
         {
             // todo: retry?
-            writefln("Requested settlement rejected: %s", status.error);
+            writefln("Settlement signature request rejected: %s", status.error);
             assert(0);
         }
 
@@ -375,9 +374,13 @@ public class SignTask
         if (status.error !is null)
         {
             // todo: retry?
-            writefln("Requested settlement rejected: %s", status.error);
+            writefln("Update signature request rejected: %s", status.error);
             assert(0);
         }
+
+        // todo: retry? add a better status code like NotReady?
+        if (status.sig == Signature.init)
+            assert(0);
 
         if (auto error = this.isInvalidUpdateMultiSig(this.pending_update,
             status.sig))
@@ -840,6 +843,12 @@ public abstract class FlashNode : FlashAPI
             update : Pair.random(),
         };
 
+        PublicNonce pub_nonce =
+        {
+            settle : priv_nonce.settle.V,
+            update : priv_nonce.update.V,
+        };
+
         auto channel = new Channel(chan_conf, this.kp, priv_nonce, peer_nonce,
             peer, this.taskman, &this.txPublisher);
         this.channels[chan_conf.chan_id] = channel;
@@ -849,7 +858,7 @@ public abstract class FlashNode : FlashAPI
             channel.start();
         });
 
-        return OpenResult(null);
+        return OpenResult(null, pub_nonce);
     }
 
     ///
@@ -938,10 +947,11 @@ public class ControlFlashNode : FlashNode, ControlAPI
 
         auto peer = this.getFlashClient(peer_pk);
         const pair_pk = this.kp.V + peer_pk;
+        const update_pair_pk = getUpdatePk(pair_pk, funding_tx_hash, num_peers);
 
         // create funding, don't sign it yet as we'll share it first
         auto funding_tx = createFundingTx(funding_utxo, funding_amount,
-            pair_pk);
+            update_pair_pk);
 
         const funding_tx_hash = hashFull(funding_tx);
         const Hash chan_id = funding_tx_hash;
@@ -954,7 +964,7 @@ public class ControlFlashNode : FlashNode, ControlAPI
             peer_pk         : peer_pk,
             pair_pk         : this.kp.V + peer_pk,
             num_peers       : num_peers,
-            update_pair_pk  : getUpdatePk(pair_pk, funding_tx_hash, num_peers),
+            update_pair_pk  : update_pair_pk,
             funding_tx      : funding_tx,
             funding_tx_hash : funding_tx_hash,
             funding_amount  : funding_amount,
@@ -980,14 +990,8 @@ public class ControlFlashNode : FlashNode, ControlAPI
             return status.error;
         }
 
-        PublicNonce peer_nonce =
-        {
-            settle : status.settle_nonce,
-            update : status.update_nonce,
-        };
-
-        auto channel = new Channel(chan_conf, this.kp, priv_nonce, peer_nonce,
-            peer, this.taskman, &this.txPublisher);
+        auto channel = new Channel(chan_conf, this.kp, priv_nonce,
+            status.peer_nonce, peer, this.taskman, &this.txPublisher);
         this.channels[chan_id] = channel;
         channel.start();
 
@@ -997,18 +1001,6 @@ public class ControlFlashNode : FlashNode, ControlAPI
     public void sendFlash (in Amount amount)
     {
         writefln("%s: sendFlash()", this.kp.V.prettify);
-
-        //// todo: use actual channel IDs, or perhaps an invoice API
-        //auto channel = this.open_channels[this.open_channels.byKey.front];
-
-        //auto update_tx = this.createUpdateTx(channel.update_pair_pk,
-        //    channel.trigger.tx,
-        //    channel.funding_amount, channel.settle_time,
-        //    channel.settle_origin_pair_pk);
-
-        //this.peerrequestSettlementSig (in Hash chan_id,
-        //    in Transaction prev_tx, Output[] outputs, in uint seq_id,
-        //    in Point peer_nonce)
     }
 
     /// convenience
@@ -1085,16 +1077,16 @@ private Transaction createSettleTx (in Transaction prev_tx,
     return settle_tx;
 }
 
-///
+/// Funding may only be spent by the trigger transaction
 private Transaction createFundingTx (in Hash utxo, in Amount funding_amount,
-    in Point pair_pk)
+    in Point trigger_pair_pk)
 {
     Transaction funding_tx = {
         type: TxType.Payment,
         inputs: [Input(utxo)],
         outputs: [
             Output(funding_amount,
-                Lock(LockType.Key, pair_pk[].dup))]
+                Lock(LockType.Key, trigger_pair_pk[].dup))]
     };
 
     return funding_tx;
