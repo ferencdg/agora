@@ -405,19 +405,24 @@ public class SignTask
 
     private Signature getUpdateSig (in Transaction update_tx)
     {
-        const update_key = getUpdateScalar(this.kp.v, this.conf.funding_tx_hash);
         const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
 
         // if the current sequence is 0 then the update tx is a trigger tx that
         // only needs a multi-sig and does not require a sequence.
-        // an update tx with seq 0 do not exist.
+        // Note that we cannot use a funding tx hash derived update key because
+        // the funding tx's key lock is part of the hash (cyclic dependency).
+        // Therefore we instead treat the trigger tx as special and simply
+        // use a multisig with the pair_pk.
+        // Note that an update tx with seq 0 do not exist.
         if (this.seq_id == 0)
         {
-            return sign(update_key, this.conf.pair_pk, nonce_pair_pk,
+            return sign(this.kp.v, this.conf.pair_pk, nonce_pair_pk,
                 this.priv_nonce.update.v, update_tx);
         }
         else
         {
+            const update_key = getUpdateScalar(this.kp.v,
+                this.conf.funding_tx_hash);
             const challenge_update = getSequenceChallenge(update_tx,
                 this.seq_id, 0);  // todo: should not be hardcoded
             return sign(update_key, this.conf.update_pair_pk, nonce_pair_pk,
@@ -947,11 +952,10 @@ public class ControlFlashNode : FlashNode, ControlAPI
 
         auto peer = this.getFlashClient(peer_pk);
         const pair_pk = this.kp.V + peer_pk;
-        const update_pair_pk = getUpdatePk(pair_pk, funding_tx_hash, num_peers);
 
         // create funding, don't sign it yet as we'll share it first
         auto funding_tx = createFundingTx(funding_utxo, funding_amount,
-            update_pair_pk);
+            pair_pk);
 
         const funding_tx_hash = hashFull(funding_tx);
         const Hash chan_id = funding_tx_hash;
@@ -964,7 +968,7 @@ public class ControlFlashNode : FlashNode, ControlAPI
             peer_pk         : peer_pk,
             pair_pk         : this.kp.V + peer_pk,
             num_peers       : num_peers,
-            update_pair_pk  : update_pair_pk,
+            update_pair_pk  : getUpdatePk(pair_pk, funding_tx_hash, num_peers),
             funding_tx      : funding_tx,
             funding_tx_hash : funding_tx_hash,
             funding_amount  : funding_amount,
@@ -1001,6 +1005,18 @@ public class ControlFlashNode : FlashNode, ControlAPI
     public void sendFlash (in Amount amount)
     {
         writefln("%s: sendFlash()", this.kp.V.prettify);
+
+        //// todo: use actual channel IDs, or perhaps an invoice API
+        //auto channel = this.open_channels[this.open_channels.byKey.front];
+
+        //auto update_tx = this.createUpdateTx(channel.update_pair_pk,
+        //    channel.trigger.tx,
+        //    channel.funding_amount, channel.settle_time,
+        //    channel.settle_origin_pair_pk);
+
+        //this.peerrequestSettlementSig (in Hash chan_id,
+        //    in Transaction prev_tx, Output[] outputs, in uint seq_id,
+        //    in Point peer_nonce)
     }
 
     /// convenience
@@ -1077,16 +1093,16 @@ private Transaction createSettleTx (in Transaction prev_tx,
     return settle_tx;
 }
 
-/// Funding may only be spent by the trigger transaction
+///
 private Transaction createFundingTx (in Hash utxo, in Amount funding_amount,
-    in Point trigger_pair_pk)
+    in Point pair_pk)
 {
     Transaction funding_tx = {
         type: TxType.Payment,
         inputs: [Input(utxo)],
         outputs: [
             Output(funding_amount,
-                Lock(LockType.Key, trigger_pair_pk[].dup))]
+                Lock(LockType.Key, pair_pk[].dup))]
     };
 
     return funding_tx;
