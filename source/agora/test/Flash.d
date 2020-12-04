@@ -476,7 +476,7 @@ public class SignTask
 
         const Unlock settle_unlock = createUnlockSettle(settle_multi_sig,
             this.seq_id);
-        Input input = settle.tx.inputs.serializeFull().deserializeFull!Input;
+        Input input = settle.tx.inputs[0].serializeFull().deserializeFull!Input;
         input.unlock = settle_unlock;
 
         // note: must always use the execution engine to validate and never
@@ -529,7 +529,7 @@ public class SignTask
             + Sig.fromBlob(peer_sig).s).toBlob();
 
         const Unlock update_unlock = this.getUpdateUnlock(update_multi_sig);
-        Input input = update.tx.inputs.serializeFull().deserializeFull!Input;
+        Input input = update.tx.inputs[0].serializeFull().deserializeFull!Input;
         input.unlock = update_unlock;
         const lock = this.getUpdateLock();
 
@@ -712,7 +712,6 @@ public class Channel
         }
 
         this.sign_task.clearState();
-
         this.channel_updates ~= update_pair;
     }
 
