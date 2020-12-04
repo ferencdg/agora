@@ -130,7 +130,7 @@ public interface FlashAPI
     ***************************************************************************/
 
     public OpenResult openChannel (in ChannelConfig chan_conf,
-        in Point settle_nonce, in Point update_nonce);
+        PublicNonce peer_nonce);
 
     /***************************************************************************
 
@@ -256,17 +256,17 @@ public enum Stage
 }
 
 /// The update & settle pair for a given sequence ID
-public class UpdatePair
+public struct UpdatePair
 {
     /// The sequence ID of this slot
     public uint seq_id;
 
-    /// Update which spends the trigger tx's outputs and can replace
+    /// Update tx which spends the trigger tx's outputs and can replace
     /// any previous update containing a lower sequence ID than this one's.
-    private Update update;
+    private Transaction update_tx;
 
-    /// Settle which spends from `update`
-    private Settle settlement;
+    /// Settle tx which spends from `update_tx` above
+    private Transaction settle_tx;
 }
 
 ///
@@ -296,10 +296,7 @@ public class SignTask
     private PrivateNonce priv_nonce;
 
     /// The nonce we expect the peer to use for this signing session
-    private PeerNonce peer_nonce;
-
-    /// Called when the settlement & update are signed & validated
-    private void delegate (UpdatePair) onComplete;
+    private PublicNonce peer_nonce;
 
     private static struct PendingSettle
     {
@@ -339,16 +336,14 @@ public class SignTask
 
     // balances allready agreed upon!
     // todo: this can be a blocking call
-    public void run (in uint seq_id, in Output[] balances,
-        PrivateNonce priv_nonce, PeerNonce peer_nonce,
-        void delegate (UpdatePair) onComplete)
+    public UpdatePair run (in uint seq_id, Output[] balances,
+        PrivateNonce priv_nonce, PublicNonce peer_nonce)
     {
         this.clearState();
         this.seq_id = seq_id;
         this.balances = balances;
         this.priv_nonce = priv_nonce;
         this.peer_nonce = peer_nonce;
-        this.onComplete = onComplete;
 
         this.pending_update = this.createPendingUpdate();
         this.pending_settle = this.createPendingSettle(this.pending_update.tx);
@@ -358,7 +353,7 @@ public class SignTask
         if (status.error !is null)
         {
             // todo: retry?
-            writefln("Requested settlement rejected: %s", error);
+            writefln("Requested settlement rejected: %s", status.error);
             assert(0);
         }
 
@@ -366,7 +361,7 @@ public class SignTask
             this.pending_settle, status.sig))
         {
             // todo: inform? ban?
-            writefln("Error during validation: %s For signature: %s",
+            writefln("Error during validation: %s For settle signature: %s",
                 error, status.sig);
             assert(0);
         }
@@ -381,20 +376,29 @@ public class SignTask
         if (status.error !is null)
         {
             // todo: retry?
-            writefln("Requested settlement rejected: %s", error);
+            writefln("Requested settlement rejected: %s", status.error);
             assert(0);
         }
 
-        if (!this.isValidUpdateMultiSig(this.pending_update, status.sig))
+        if (auto error = this.isInvalidUpdateMultiSig(
+            this.pending_update, status.sig))
         {
             // todo: inform? ban?
-            writefln("Received invalid signaturee: %s", status.sig);
+            writefln("Error during validation: %s For update signature: %s",
+                error, status.sig);
             assert(0);
         }
         this.pending_update.peer_sig = status.sig;
         this.pending_update.validated = true;
 
-        // now we have our signature, check it and then request update sig
+        UpdatePair pair =
+        {
+            seq_id : this.seq_id,
+            update_tx : this.pending_update.tx,
+            settle_tx : this.pending_settle.tx,
+        };
+
+        return pair;
     }
 
     private Signature getUpdateSig (in Transaction update_tx)
@@ -408,25 +412,25 @@ public class SignTask
         if (this.seq_id == 0)
         {
             return sign(update_key, this.conf.pair_pk, nonce_pair_pk,
-                this.priv_nonce.v, update_tx);
+                this.priv_nonce.update.v, update_tx);
         }
         else
         {
             const challenge_update = getSequenceChallenge(update_tx,
                 this.seq_id, 0);  // todo: should not be hardcoded
-            return sign(update_key, settle_pair_pk, nonce_pair_pk,
-                this.priv_nonce.settle.v, challenge_settle);
+            return sign(update_key, this.conf.update_pair_pk, nonce_pair_pk,
+                this.priv_nonce.update.v, challenge_update);
         }
     }
 
     private PendingUpdate createPendingUpdate ()
     {
-        const update_tx = createUpdateTx(this.conf, seq_id);
-        const our_sig = this.getUpdateSig(update_tx);
+        auto update_tx = createUpdateTx(this.conf, seq_id);
+        const sig = this.getUpdateSig(update_tx);
 
         PendingUpdate update =
         {
-            tx        : settle_tx,
+            tx        : update_tx,
             our_sig   : sig,
             validated : false,
         };
@@ -443,7 +447,7 @@ public class SignTask
         const nonce_pair_pk = this.priv_nonce.settle.V + this.peer_nonce.settle;
 
         const uint input_idx = 0;  // this should ideally not be hardcoded
-        const settle_tx = createSettleTx(update_tx, this.conf.settle_time,
+        auto settle_tx = createSettleTx(update_tx, this.conf.settle_time,
             this.balances);
         const challenge_settle = getSequenceChallenge(settle_tx, this.seq_id,
             input_idx);
@@ -451,6 +455,7 @@ public class SignTask
         const sig = sign(settle_key, settle_pair_pk, nonce_pair_pk,
             this.priv_nonce.settle.v, challenge_settle);
 
+        // settle.tx.inputs[0].unlock =
         PendingSettle settle =
         {
             tx        : settle_tx,
@@ -471,8 +476,8 @@ public class SignTask
 
         const Unlock settle_unlock = createUnlockSettle(settle_multi_sig,
             this.seq_id);
-        // todo: should not be hardcoded to idx 0
-        settle.tx.inputs[0].unlock = settle_unlock;
+        Input input = settle.tx.inputs.serializeFull().deserializeFull!Input;
+        input.unlock = settle_unlock;
 
         // note: must always use the execution engine to validate and never
         // try to validate the signatures manually.
@@ -480,11 +485,9 @@ public class SignTask
         const TestStackMaxItemSize = 512;
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
         if (auto error = engine.execute(
-            settle.prev_tx.outputs[0].lock, settle_unlock, settle.tx,
-                settle.tx.inputs[0]))
-        {
+            this.pending_update.tx.outputs[0].lock, settle_unlock, settle.tx,
+            input))
             return error;
-        }
 
         return null;
     }
@@ -500,6 +503,23 @@ public class SignTask
             return createUnlockUpdate(update_multi_sig, this.seq_id);
     }
 
+    private Lock getUpdateLock ()
+    {
+        // if the current sequence is 0 then the lock is the funding tx's lock,
+        // otherwise it's the trigger tx's lock
+        if (this.seq_id == 0)
+        {
+            return this.conf.funding_tx.outputs[0].lock;
+        }
+        else
+        {
+            const prev_seq = this.seq_id - 1;
+            return createLockEltoo(this.conf.settle_time,
+                this.conf.funding_tx_hash, this.conf.pair_pk, prev_seq,
+                this.conf.num_peers);
+        }
+    }
+
     private string isInvalidUpdateMultiSig (in PendingUpdate update,
         in Signature peer_sig)
     {
@@ -508,22 +528,21 @@ public class SignTask
               Sig.fromBlob(update.our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
 
-        const Unlock update_unlock = this.getUpdateUnlock(update_multi_sig,
-            this.seq_id);
+        const Unlock update_unlock = this.getUpdateUnlock(update_multi_sig);
+        Input input = update.tx.inputs.serializeFull().deserializeFull!Input;
+        input.unlock = update_unlock;
+        const lock = this.getUpdateLock();
+
         // todo: should not be hardcoded to idx 0
-        update.tx.inputs[0].unlock = update_unlock;
+        //update.tx.inputs[0].unlock = update_unlock;
 
         // note: must always use the execution engine to validate and never
         // try to validate the signatures manually.
         const TestStackMaxTotalSize = 16_384;
         const TestStackMaxItemSize = 512;
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
-        if (auto error = engine.execute(
-            update.prev_tx.outputs[0].lock, update_unlock, update.tx,
-                update.tx.inputs[0]))
-        {
+        if (auto error = engine.execute(lock, update_unlock, update.tx, input))
             return error;
-        }
 
         return null;
     }
@@ -552,8 +571,8 @@ public class SignTask
     /// Cancels any existing tasks and clears the state
     public void clearState ()
     {
-        this.pending_settle = Settle.init;
-        this.pending_update = Update.init;
+        this.pending_settle = PendingSettle.init;
+        this.pending_update = PendingUpdate.init;
 
         // cancel any pending tasks
         if (this.request_task !is null)
@@ -571,7 +590,7 @@ struct PrivateNonce
     Pair update;
 }
 
-public struct PeerNonce
+public struct PublicNonce
 {
     Point settle;
     Point update;
@@ -608,12 +627,8 @@ public class Channel
     /// The signer for an update / settle pair
     private SignTask sign_task;
 
-    /// Contains the trigger tx to initiate closing the channel,
-    /// and the initial refund settlement.
-    private UpdatePair trigger_pair;
-
     /// The list of any off-chain updates which happened on this channel
-    private DList!UpdatePair channel_updates;
+    private UpdatePair[] channel_updates;
 
     /// The current sequence ID
     private uint cur_seq_id;
@@ -625,11 +640,11 @@ public class Channel
     private PrivateNonce priv_nonce;
 
     /// The peer's public nonces for the current signing phase
-    private PeerNonce peer_nonce;
+    private PublicNonce peer_nonce;
 
     /// Ctor
     public this (in ChannelConfig conf, in Pair kp, PrivateNonce priv_nonce,
-        PeerNonce peer_nonce, FlashAPI peer, SchedulingTaskManager taskman,
+        PublicNonce peer_nonce, FlashAPI peer, SchedulingTaskManager taskman,
         void delegate (in Transaction) txPublisher)
     {
         this.conf = conf;
@@ -655,15 +670,37 @@ public class Channel
         assert(this.cur_seq_id == 0);
 
         const seq_id = 0;
-        this.sign_task.run(seq_id, this.conf.funding_tx, this.balances,
-            this.priv_nonce, this.peer_nonce, &this.onSetupComplete);
+
+        auto pair = this.sign_task.run(seq_id, this.balances, this.priv_nonce,
+            this.peer_nonce);
+        this.onSetupComplete(pair);
+    }
+
+    public bool waitingForFunding ()
+    {
+        return this.stage == Stage.WaitForFunding;
+    }
+
+    public void fundingExternalized (in Transaction tx)
+    {
+        // this is not technically an error, but it would be very strange
+        // that a funding tx was published before signing was complete.
+        // in this case we may want to just store the funding tx here
+        // and then automatically jump a stage
+        this.funding_tx_signed = tx.serializeFull.deserializeFull!Transaction;
+
+        if (this.stage == Stage.WaitForFunding)
+            this.stage = Stage.Open;
     }
 
     ///
-    private void onSetupComplete (UpdatePair trigger_pair)
+    private void onSetupComplete (UpdatePair update_pair)
     {
-        this.stage = Stage.WaitForFunding;
-        this.trigger_pair = update_pair;
+        // funder already published the funding tx for whatever reason
+        if (this.funding_tx_signed != Transaction.init)
+            this.stage = Stage.Open;
+        else
+            this.stage = Stage.WaitForFunding;
 
         this.funding_tx_signed = this.conf.funding_tx.clone();
         this.funding_tx_signed.inputs[0].unlock
@@ -671,24 +708,24 @@ public class Channel
 
         this.txPublisher(this.funding_tx_signed);
         this.sign_task.clearState();
-        // only updated when we're ready to sign a new balance redistribution
-        //this.cur_seq_id++;
+
+        this.channel_updates ~= update_pair;
     }
 
     ///
-    public string requestSettleSig (in uint seq_id)
+    public SigResult requestSettleSig (in uint seq_id)
     {
         if (auto error = this.isInvalidSeq(seq_id))
-            return error;
+            return SigResult(error);
 
         return this.sign_task.requestSettleSig();
     }
 
     ///
-    public string requestUpdateSig (in uint seq_id)
+    public SigResult requestUpdateSig (in uint seq_id)
     {
         if (auto error = this.isInvalidSeq(seq_id))
-            return error;
+            return SigResult(error);
 
         return this.sign_task.requestUpdateSig();
     }
@@ -769,8 +806,8 @@ public abstract class FlashNode : FlashAPI
     }
 
     /// Called by a channel funder
-    public override string openChannel (in ChannelConfig chan_conf,
-        in Point peer_settle_nonce, in Point peer_udpate_nonce)
+    public override OpenResult openChannel (in ChannelConfig chan_conf,
+        PublicNonce peer_nonce)
     {
         writefln("%s: openChannel()", this.kp.V.prettify);
 
@@ -784,29 +821,31 @@ public abstract class FlashNode : FlashAPI
         // a dupe temporary channel ID once it's removed from
         // `this.channels`
         if (chan_conf.chan_id in this.channels)
-            return "There is already an open channel with this ID";
+            return OpenResult("There is already an open channel with this ID");
 
         auto peer = this.getFlashClient(chan_conf.funder_pk);
 
         const our_gen_hash = hashFull(GenesisBlock);
         if (chan_conf.gen_hash != our_gen_hash)
-            return "Unrecognized blockchain genesis hash";
+            return OpenResult("Unrecognized blockchain genesis hash");
 
         const min_funding = Amount(1000);
         if (chan_conf.funding_amount < min_funding)
-            return "Funding amount is too low";
+            return OpenResult("Funding amount is too low");
 
         const min_settle_time = 5;
         const max_settle_time = 10;
         if (chan_conf.settle_time < min_settle_time ||
             chan_conf.settle_time > max_settle_time)
-            return "Settle time is not within acceptable limits";
+            return OpenResult("Settle time is not within acceptable limits");
 
-        Pair our_nonce_settle_kp = Pair.random();
-        Pair our_nonce_update_kp = Pair.random();
+        PrivateNonce priv_nonce =
+        {
+            settle : Pair.random(),
+            update : Pair.random(),
+        };
 
-        auto channel = new Channel(chan_conf, this.kp, our_nonce_settle_kp,
-            our_nonce_update_kp, peer_settle_nonce, peer_udpate_nonce,
+        auto channel = new Channel(chan_conf, this.kp, priv_nonce, peer_nonce,
             peer, this.taskman, &this.txPublisher);
         this.channels[chan_conf.chan_id] = channel;
 
@@ -815,49 +854,25 @@ public abstract class FlashNode : FlashAPI
             channel.start();
         });
 
-        return null;
+        return OpenResult(null);
     }
 
     ///
-    public override SigResult requestSettleSig (in Hash chan_id,
-        in uint seq_id, in Transaction prev_tx, Output[] outputs,
-        in Point peer_nonce)
+    public override SigResult requestSettleSig (in Hash chan_id, in uint seq_id)
     {
         if (auto channel = chan_id in this.channels)
-            return channel.requestSettleSig(prev_tx, seq_id, outputs,
-                peer_nonce);
+            return channel.requestSettleSig(seq_id);
 
         return SigResult("Channel ID not found");
     }
 
     ///
-    public override string receiveSettleSig (in Hash chan_id,
-        in uint seq_id, in Point peer_nonce, in Signature peer_sig)
+    public override SigResult requestUpdateSig (in Hash chan_id, in uint seq_id)
     {
         if (auto channel = chan_id in this.channels)
-            return channel.receiveSettleSig(seq_id, peer_nonce, peer_sig);
+            return channel.requestUpdateSig(seq_id);
 
-        return "Channel ID not found";
-    }
-
-    ///
-    public override string requestUpdateSig (in Hash chan_id,
-        in uint seq_id, in Point peer_nonce, Transaction update_tx)
-    {
-        if (auto channel = chan_id in this.channels)
-            return channel.requestUpdateSig(seq_id, peer_nonce, update_tx);
-
-        return "Channel ID not found";
-    }
-
-    ///
-    public override string receiveUpdateSig (in Hash chan_id,
-        in uint seq_id, in Point peer_nonce, in Signature peer_sig)
-    {
-        if (auto channel = chan_id in this.channels)
-            return channel.receiveUpdateSig(seq_id, peer_nonce, peer_sig);
-
-        return "Channel ID not found";
+        return SigResult("Channel ID not found");
     }
 
     ///
@@ -885,27 +900,14 @@ public abstract class FlashNode : FlashAPI
         Hash[] pending_chans_to_remove;
         foreach (hash, ref channel; this.channels)
         {
-            // todo
-            //if (channel.funding_externalized
-            //    && channel.last_settlement != Settle.init
-            //    && channel.trigger != Update.init)
-            //{
-            //    writefln("%s: Channel open(%s)", this.kp.V.prettify,
-            //        hash.prettify);
-            //    //open_channels[channel.conf.funding_tx_hash] = channel;
-            //    pending_chans_to_remove ~= hash;
-            //    continue;
-            //}
+            if (!channel.waitingForFunding())
+                continue;
 
-            if (!channel.funding_externalized)
             foreach (tx; last_block.txs)
             {
                 if (tx.hashFull() == channel.conf.funding_tx_hash)
                 {
-                    if (channel.funding_tx_signed != Transaction.init)
-                        channel.funding_tx_signed = tx.clone();
-
-                    channel.funding_externalized = true;
+                    channel.fundingExternalized(tx);
                     writefln("%s: Funding tx externalized(%s)",
                         this.kp.V.prettify, channel.conf.funding_tx_hash.prettify);
                     break;
@@ -964,30 +966,29 @@ public class ControlFlashNode : FlashNode, ControlAPI
             settle_time     : settle_time,
         };
 
-        Pair our_nonce_settle_kp = Pair.random();
-        Pair our_nonce_update_kp = Pair.random();
-
-        auto open_res = peer.openChannel(chan_conf, our_nonce_settle_kp.V,
-            our_nonce_update_kp.V);
-        if (open_res.error.length > 0)
-        {
-            writefln("Peer rejected openChannel() request: %s", open_res.error);
-            return error;
-        }
-
-        our_nonce_settle_kp,
-        our_nonce_update_kp, open_res.settle_nonce, open_res.update_nonce,
-
         PrivateNonce priv_nonce =
         {
-            nonce_settle_kp : our_nonce_settle_kp,
-            nonce_update_kp : our_nonce_update_kp,
+            settle : Pair.random(),
+            update : Pair.random(),
         };
 
-        PeerNonce peer_nonce =
+        PublicNonce pub_nonce =
         {
-            settle_nonce : open_res.settle_nonce,
-            update_nonce : open_res.update_nonce,
+            settle : priv_nonce.settle.V,
+            update : priv_nonce.update.V,
+        };
+
+        auto status = peer.openChannel(chan_conf, pub_nonce);
+        if (status.error.length > 0)
+        {
+            writefln("Peer rejected openChannel() request: %s", status.error);
+            return status.error;
+        }
+
+        PublicNonce peer_nonce =
+        {
+            settle : status.settle_nonce,
+            update : status.update_nonce,
         };
 
         auto channel = new Channel(chan_conf, this.kp, priv_nonce, peer_nonce,
