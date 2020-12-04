@@ -488,7 +488,7 @@ public class SignTask
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
         if (auto error = engine.execute(
             this.pending_update.tx.outputs[0].lock, settle_tx.inputs[0].unlock,
-            settle_tx, input))
+            settle_tx, settle_tx.inputs[0]))
             return error;
 
         return null;
@@ -515,7 +515,7 @@ public class SignTask
         const TestStackMaxItemSize = 512;
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
         if (auto error = engine.execute(lock, update_tx.inputs[0].unlock,
-            update_tx, input))
+            update_tx, update_tx.inputs[0]))
             return error;
 
         return null;
