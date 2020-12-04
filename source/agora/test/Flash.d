@@ -784,8 +784,8 @@ public class Channel
     public void signUpdate (in uint seq_id, PrivateNonce priv_nonce,
         PublicNonce peer_nonce, in Balance new_balance)
     {
-        writefln("%s: signUpdate(%s, %s)", this.kp.V.prettify,
-            seq_id, new_balance);
+        writefln("%s: signUpdate(%s)", this.kp.V.prettify,
+            seq_id);
 
         assert(this.state == State.Open);
         assert(seq_id == this.cur_seq_id + 1);
@@ -939,8 +939,8 @@ public abstract class FlashNode : FlashAPI
     public override BalanceResult requestUpdateBalance (in Hash chan_id,
         in uint seq_id, in BalanceRequest balance_req)
     {
-        writefln("%s: requestUpdateBalance(%s, %s, %s)", this.kp.V.prettify,
-            chan_id.prettify, seq_id, balance_req);
+        writefln("%s: requestUpdateBalance(%s, %s)", this.kp.V.prettify,
+            chan_id.prettify, seq_id);
 
         auto channel = chan_id in this.channels;
         if (channel is null)
