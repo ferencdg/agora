@@ -513,7 +513,7 @@ public class SignTask
         return settle;
     }
 
-    private string isInvalidSettleMultiSig (in PendingSettle settle,
+    private string isInvalidSettleMultiSig (ref PendingSettle settle,
         in Signature peer_sig, in PrivateNonce priv_nonce,
         in PublicNonce peer_nonce)
     {
@@ -539,10 +539,11 @@ public class SignTask
             settle_tx, settle_tx.inputs[0]))
             return error;
 
+        settle.tx = settle_tx;
         return null;
     }
 
-    private string isInvalidUpdateMultiSig (in PendingUpdate update,
+    private string isInvalidUpdateMultiSig (ref PendingUpdate update,
         in Signature peer_sig, in PrivateNonce priv_nonce,
         in PublicNonce peer_nonce)
     {
@@ -567,6 +568,7 @@ public class SignTask
             update_tx, update_tx.inputs[0]))
             return error;
 
+        update.tx = update_tx;
         return null;
     }
 
@@ -804,6 +806,15 @@ public class Channel
         this.cur_balance.outputs = new_balance.outputs.dup;
     }
 
+    public UpdatePair close ()
+    {
+        assert(this.isOpen());
+        this.state = State.Closed;
+
+        // publish the trigger transaction
+        return this.channel_updates[0];
+    }
+
     ///
     private string isInvalidSeq (in uint seq_id)
     {
@@ -825,12 +836,12 @@ public interface ControlAPI : FlashAPI
     public Hash ctrlOpenChannel (in Hash funding_hash, in Amount funding_amount,
         in uint settle_time, in Point peer_pk);
 
-    public void ctrlUpdateBalance (in Hash chan_id, in Amount funder,
+    public UpdatePair ctrlUpdateBalance (in Hash chan_id, in Amount funder,
         in Amount peer);
 
     public void ctrlCloseChannel (in Hash chan_id);
 
-    /// convenience
+    // todo: add channel ID
     public bool readyToExternalize ();
 
     /// ditto
@@ -1008,7 +1019,7 @@ public abstract class FlashNode : FlashAPI
                 {
                     channel.fundingExternalized(tx);
                     writefln("%s: Funding tx externalized(%s)",
-                        this.kp.V.prettify, channel.conf.funding_tx_hash.prettify);
+                        this.kp.V.prettify, channel.conf.funding_tx_hash);
                     break;
                 }
             }
@@ -1086,10 +1097,9 @@ public class ControlFlashNode : FlashNode, ControlAPI
     }
 
     /// Control API
-    public override void ctrlUpdateBalance (in Hash chan_id,
+    public override UpdatePair ctrlUpdateBalance (in Hash chan_id,
         in Amount funder_amount, in Amount peer_amount)
     {
-        in Amount funder_amount, in Amount peer_amount)
         writefln("%s: ctrlUpdateBalance(%s, %s, %s)", this.kp.V.prettify,
             chan_id.prettify, funder_amount, peer_amount);
 
@@ -1117,22 +1127,14 @@ public class ControlFlashNode : FlashNode, ControlAPI
             balance_req);
         assert(status.error is null, status.error);
 
-        this.taskman.schedule(
-        {
-            channel.signUpdate(seq_id, priv_nonce, status.peer_nonce, balance);
-        });
+        channel.signUpdate(seq_id, priv_nonce, status.peer_nonce, balance);
+        return channel.close();
     }
 
     /// convenience
     public override bool readyToExternalize ()
     {
         return this.ready_to_externalize;
-    }
-
-    /// convenience
-    public override bool readyToClose ()
-    {
-        return this.ready_to_close;
     }
 
     /// ditto
@@ -1455,7 +1457,7 @@ unittest
     network.start();
     scope (exit) network.shutdown();
     //scope (exit) network.printLogs();
-    //scope (failure) network.printLogs();
+    scope (failure) network.printLogs();
     network.waitForDiscovery();
 
     auto nodes = network.clients;
@@ -1507,28 +1509,61 @@ unittest
     txs.each!(tx => node_1.putTransaction(tx));
     network.expectBlock(Height(2), network.blocks[0].header);
 
+    // todo: should check both parties if they're ready
     while (!alice.anyChannelOpen())
     {
         // there should be an infinite loop here which keeps creating txs
         Thread.sleep(100.msecs);
     }
 
-    alice.ctrlUpdateBalance(chan_id, Amount(10_000), Amount(5_000));
-    alice.ctrlCloseChannel(chan_id);
+    Thread.sleep(1.seconds);
 
-    while (!alice.readyToClose())
+    // there seems to be a timing issue (channel not funded for counter-party yet)
+    auto update_pair = alice.ctrlUpdateBalance(
+        chan_id, Amount(10_000), Amount(5_000));
+
+    // now we publish trigger tx
+    const block_2 = node_1.getBlocksFrom(0, 1024)[$ - 1];
+
+    foreach (idx, tx; block_2.txs)
     {
-        // there should be an infinite loop here which keeps creating txs
-        Thread.sleep(100.msecs);
+        //writefln("%s match: %s", idx, tx.outputs[0].lock.bytes);
     }
 
-    // now we create a new one
-    txs = txs.map!(tx => TxBuilder(tx, 0))
-        .enumerate()
-        .map!(en => en.value.refund(WK.Keys[en.index].address).sign())
-        .array();
-    txs.each!(tx => node_1.putTransaction(tx));
-    network.expectBlock(Height(2), network.blocks[0].header);
+    const funding_tx_hash = Hash.fromString("0x54615ad5a07681a1a4e677ede7bd325c570d2d5003b0f86e6c03f3031a4d905514354cf72048f9c50c7ccdca251a01fa8971fe042f8e67e9b21652d54162241b");
 
-    Thread.sleep(1.seconds);
+    txs = filtSpendable!(tx => tx.hashFull() != funding_tx_hash)(block_2)
+        .enumerate()
+        .map!(en => en.value.refund(WK.Keys[3].address).sign())
+        .take(7)
+        .array();
+    writefln("Posting update tx: %s", update_pair.update_tx.hashFull());
+    txs ~= update_pair.update_tx;
+
+    txs.each!(tx => node_1.putTransaction(tx));
+    network.expectBlock(Height(3), network.blocks[0].header);
+
+    //const block_3 = node_1.getBlocksFrom(0, 1024)[$ - 1];
+    //txs = filtSpendable!(tx => tx.hashFull() != funding_tx_hash)(block_3)
+    //    .enumerate()
+    //    .map!(en => en.value.refund(WK.Keys[3].address).sign())
+    //    .take(7)
+    //    .array();
+    //txs ~= update_pair.settle_tx;
+
+    //txs.each!(tx => node_1.putTransaction(tx));
+    //network.expectBlock(Height(4), network.blocks[0].header);
+
+    //Thread.sleep(1.seconds);
+}
+
+import agora.consensus.data.Block;
+import std.range;
+public auto filtSpendable (alias filt)(const ref Block block)
+{
+    return block.txs
+        .filter!(tx => tx.type == TxType.Payment)
+        .filter!(tx => filt(tx))
+        .map!(tx => iota(tx.outputs.length).map!(idx => TxBuilder(tx, cast(uint)idx)))
+        .joiner();
 }
