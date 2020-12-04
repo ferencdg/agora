@@ -329,12 +329,6 @@ public class SignTask
     /// re-try the same sequence IDs
     private uint seq_id;
 
-    /// The private nonce we'll use for this signing session
-    private PrivateNonce priv_nonce;
-
-    /// The nonce we expect the peer to use for this signing session
-    private PublicNonce peer_nonce;
-
     private static struct PendingSettle
     {
         private Transaction tx;
@@ -373,17 +367,17 @@ public class SignTask
 
     // balance allready agreed upon!
     // todo: this can be a blocking call
+    /// priv_nonce = The private nonce we'll use for this signing session
+    /// peer_nonce = The nonce we expect the peer to use for this signing session
     public UpdatePair run (in uint seq_id, in Balance balance,
         PrivateNonce priv_nonce, PublicNonce peer_nonce)
     {
         this.clearState();
         this.seq_id = seq_id;
-        this.priv_nonce = priv_nonce;
-        this.peer_nonce = peer_nonce;
 
-        this.pending_update = this.createPendingUpdate();
+        this.pending_update = this.createPendingUpdate(priv_nonce, peer_nonce);
         this.pending_settle = this.createPendingSettle(this.pending_update.tx,
-            balance);
+            balance, priv_nonce, peer_nonce);
 
         auto status = this.peer.requestSettleSig(this.conf.chan_id,
             seq_id);
@@ -395,7 +389,7 @@ public class SignTask
         }
 
         if (auto error = this.isInvalidSettleMultiSig(this.pending_settle,
-            status.sig))
+            status.sig, priv_nonce, peer_nonce))
         {
             // todo: inform? ban?
             writefln("Error during validation: %s For settle signature: %s",
@@ -421,7 +415,7 @@ public class SignTask
             assert(0);
 
         if (auto error = this.isInvalidUpdateMultiSig(this.pending_update,
-            status.sig))
+            status.sig, priv_nonce, peer_nonce))
         {
             // todo: inform? ban?
             writefln("Error during validation: %s For update signature: %s",
@@ -441,9 +435,10 @@ public class SignTask
         return pair;
     }
 
-    private Signature getUpdateSig (in Transaction update_tx)
+    private Signature getUpdateSig (in Transaction update_tx,
+        in PrivateNonce priv_nonce, in PublicNonce peer_nonce)
     {
-        const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
+        const nonce_pair_pk = priv_nonce.update.V + peer_nonce.update;
 
         // if the current sequence is 0 then the update tx is a trigger tx that
         // only needs a multi-sig and does not require a sequence.
@@ -455,7 +450,7 @@ public class SignTask
         if (this.seq_id == 0)
         {
             return sign(this.kp.v, this.conf.pair_pk, nonce_pair_pk,
-                this.priv_nonce.update.v, update_tx);
+                priv_nonce.update.v, update_tx);
         }
         else
         {
@@ -464,14 +459,15 @@ public class SignTask
             const challenge_update = getSequenceChallenge(update_tx,
                 this.seq_id, 0);  // todo: should not be hardcoded
             return sign(update_key, this.conf.update_pair_pk, nonce_pair_pk,
-                this.priv_nonce.update.v, challenge_update);
+                priv_nonce.update.v, challenge_update);
         }
     }
 
-    private PendingUpdate createPendingUpdate ()
+    private PendingUpdate createPendingUpdate (in PrivateNonce priv_nonce,
+        in PublicNonce peer_nonce)
     {
         auto update_tx = createUpdateTx(this.conf, seq_id);
-        const sig = this.getUpdateSig(update_tx);
+        const sig = this.getUpdateSig(update_tx, priv_nonce, peer_nonce);
 
         PendingUpdate update =
         {
@@ -484,13 +480,14 @@ public class SignTask
     }
 
     private PendingSettle createPendingSettle (in Transaction update_tx,
-        in Balance balance)
+        in Balance balance, in PrivateNonce priv_nonce,
+        in PublicNonce peer_nonce)
     {
         const settle_key = getSettleScalar(this.kp.v, this.conf.funding_tx_hash,
             this.seq_id);
         const settle_pair_pk = getSettlePk(this.conf.pair_pk,
             this.conf.funding_tx_hash, this.seq_id, this.conf.num_peers);
-        const nonce_pair_pk = this.priv_nonce.settle.V + this.peer_nonce.settle;
+        const nonce_pair_pk = priv_nonce.settle.V + peer_nonce.settle;
 
         const uint input_idx = 0;  // this should ideally not be hardcoded
         auto settle_tx = createSettleTx(update_tx, this.conf.settle_time,
@@ -499,7 +496,7 @@ public class SignTask
             input_idx);
 
         const sig = sign(settle_key, settle_pair_pk, nonce_pair_pk,
-            this.priv_nonce.settle.v, challenge_settle);
+            priv_nonce.settle.v, challenge_settle);
 
         // settle.tx.inputs[0].unlock =
         PendingSettle settle =
@@ -513,9 +510,10 @@ public class SignTask
     }
 
     private string isInvalidSettleMultiSig (in PendingSettle settle,
-        in Signature peer_sig)
+        in Signature peer_sig, in PrivateNonce priv_nonce,
+        in PublicNonce peer_nonce)
     {
-        const nonce_pair_pk = this.priv_nonce.settle.V + this.peer_nonce.settle;
+        const nonce_pair_pk = priv_nonce.settle.V + peer_nonce.settle;
         const settle_multi_sig = Sig(nonce_pair_pk,
               Sig.fromBlob(settle.our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
@@ -541,9 +539,10 @@ public class SignTask
     }
 
     private string isInvalidUpdateMultiSig (in PendingUpdate update,
-        in Signature peer_sig)
+        in Signature peer_sig, in PrivateNonce priv_nonce,
+        in PublicNonce peer_nonce)
     {
-        const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
+        const nonce_pair_pk = priv_nonce.update.V + peer_nonce.update;
         const update_multi_sig = Sig(nonce_pair_pk,
               Sig.fromBlob(update.our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
@@ -659,18 +658,18 @@ public class Channel
     /// Used to publish funding / trigger / update / settlement txs to blockchain
     public const void delegate (in Transaction) txPublisher;
 
+    /// Task manager to spawn fibers with
+    public SchedulingTaskManager taskman;
+
     /// The peer of the other end of the channel
     public FlashAPI peer;
 
-    /// Task manager to spawn fibers with
-    public SchedulingTaskManager taskman;
+    /// Current state of the channel
+    private State state;
 
     /// Stored when the funding transaction is signed.
     /// For peers they receive this from the blockchain.
     public Transaction funding_tx_signed;
-
-    /// Current state of the channel
-    private State state;
 
     /// The signer for an update / settle pair
     private SignTask sign_task;
@@ -685,21 +684,13 @@ public class Channel
     /// funding tx is externalized.
     private Balance cur_balance;
 
-    /// Our private nonces for the current signing phase
-    private PrivateNonce priv_nonce;
-
-    /// The peer's public nonces for the current signing phase
-    private PublicNonce peer_nonce;
-
     /// Ctor
-    public this (in ChannelConfig conf, in Pair kp, PrivateNonce priv_nonce,
-        PublicNonce peer_nonce, FlashAPI peer, SchedulingTaskManager taskman,
+    public this (in ChannelConfig conf, in Pair kp, FlashAPI peer,
+        SchedulingTaskManager taskman,
         void delegate (in Transaction) txPublisher)
     {
         this.conf = conf;
         this.kp = kp;
-        this.priv_nonce = priv_nonce;
-        this.peer_nonce = peer_nonce;
         this.is_owner = conf.funder_pk == kp.V;
         this.peer = peer;
         this.taskman = taskman;
@@ -721,7 +712,7 @@ public class Channel
     }
 
     /// Start routine for the channel
-    public void start ()
+    public void start (in PrivateNonce priv_nonce, in PublicNonce peer_nonce)
     {
         assert(this.state == State.Setup);
         assert(this.cur_seq_id == 0);
@@ -730,8 +721,7 @@ public class Channel
         const seq_id = 0;
         auto balance = Balance([Output(this.conf.funding_amount,
             PublicKey(this.conf.funder_pk[]))]);
-        auto pair = this.sign_task.run(seq_id, balance, this.priv_nonce,
-            this.peer_nonce);
+        auto pair = this.sign_task.run(seq_id, balance, priv_nonce, peer_nonce);
         this.onSetupComplete(pair);
     }
 
@@ -794,15 +784,17 @@ public class Channel
     public void signUpdate (in uint seq_id, PrivateNonce priv_nonce,
         PublicNonce peer_nonce, in Balance new_balance)
     {
+        writefln("%s: signUpdate(%s, %s)", this.kp.V.prettify,
+            seq_id, new_balance);
+
         assert(this.state == State.Open);
         assert(seq_id == this.cur_seq_id + 1);
 
         this.cur_seq_id++;
-        this.priv_nonce = priv_nonce;
-        this.peer_nonce = peer_nonce;
         auto update_pair = this.sign_task.run(this.cur_seq_id, new_balance,
-            this.priv_nonce, this.peer_nonce);
+            priv_nonce, peer_nonce);
 
+        writefln("%s: Got new update pair!", this.kp.V.prettify);
         this.sign_task.clearState();
         this.channel_updates ~= update_pair;
         this.cur_balance.outputs = new_balance.outputs.dup;
@@ -913,13 +905,13 @@ public abstract class FlashNode : FlashAPI
         PrivateNonce priv_nonce = genPrivateNonce();
         PublicNonce pub_nonce = priv_nonce.getPublicNonce();
 
-        auto channel = new Channel(chan_conf, this.kp, priv_nonce, peer_nonce,
-            peer, this.taskman, &this.txPublisher);
+        auto channel = new Channel(chan_conf, this.kp, peer, this.taskman,
+            &this.txPublisher);
         this.channels[chan_conf.chan_id] = channel;
 
         this.taskman.schedule(
         {
-            channel.start();
+            channel.start(priv_nonce, peer_nonce);
         });
 
         return OpenResult(null, pub_nonce);
@@ -947,6 +939,9 @@ public abstract class FlashNode : FlashAPI
     public override BalanceResult requestUpdateBalance (in Hash chan_id,
         in uint seq_id, in BalanceRequest balance_req)
     {
+        writefln("%s: requestUpdateBalance(%s, %s, %s)", this.kp.V.prettify,
+            chan_id.prettify, seq_id, balance_req);
+
         auto channel = chan_id in this.channels;
         if (channel is null)
             return BalanceResult("Channel ID not found");
@@ -1068,10 +1063,10 @@ public class ControlFlashNode : FlashNode, ControlAPI
         auto status = peer.openChannel(chan_conf, pub_nonce);
         assert(status.error is null, status.error);
 
-        auto channel = new Channel(chan_conf, this.kp, priv_nonce,
-            status.peer_nonce, peer, this.taskman, &this.txPublisher);
+        auto channel = new Channel(chan_conf, this.kp, peer, this.taskman,
+            &this.txPublisher);
         this.channels[chan_id] = channel;
-        channel.start();
+        channel.start(priv_nonce, status.peer_nonce);
 
         return chan_id;
     }
@@ -1081,7 +1076,7 @@ public class ControlFlashNode : FlashNode, ControlAPI
         in Amount funder_amount, in Amount peer_amount)
     {
         writefln("%s: ctrlUpdateBalance(%s, %s, %s)", this.kp.V.prettify,
-            chan_id, funder_amount, peer_amount);
+            chan_id.prettify, funder_amount, peer_amount);
 
         auto channel = chan_id in this.channels;
         assert(channel !is null);
