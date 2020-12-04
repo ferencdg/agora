@@ -399,6 +399,7 @@ public class SignTask
 
     private Signature getUpdateSig (in Transaction update_tx)
     {
+        const update_key = getUpdateScalar(this.kp.v, this.conf.funding_tx_hash);
         const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
 
         // if the current sequence is 0 then the update tx is a trigger tx that
@@ -406,14 +407,14 @@ public class SignTask
         // an update tx with seq 0 do not exist.
         if (this.seq_id == 0)
         {
-            return sign(this.kp.v, this.conf.pair_pk, nonce_pair_pk,
+            return sign(update_key, this.conf.pair_pk, nonce_pair_pk,
                 this.priv_nonce.v, update_tx);
         }
         else
         {
             const challenge_update = getSequenceChallenge(update_tx,
                 this.seq_id, 0);  // todo: should not be hardcoded
-            return sign(this.kp.v, settle_pair_pk, nonce_pair_pk,
+            return sign(update_key, settle_pair_pk, nonce_pair_pk,
                 this.priv_nonce.settle.v, challenge_settle);
         }
     }
@@ -421,7 +422,7 @@ public class SignTask
     private PendingUpdate createPendingUpdate ()
     {
         const update_tx = createUpdateTx(this.conf, seq_id);
-
+        const our_sig = this.getUpdateSig(update_tx);
 
         PendingUpdate update =
         {
@@ -546,89 +547,6 @@ public class SignTask
                 ~ "settlement signature is received");
 
         return SigResult(null, this.pending_update.our_sig);
-    }
-
-    ///
-    public string receiveUpdateSig (in Point peer_nonce, in Signature peer_sig)
-    {
-        writefln("%s: receiveUpdateSig(%s)", this.kp.V.prettify,
-            this.conf.chan_id.prettify);
-
-        auto update = &this.pending_update;
-        if (*update == Update.init)
-            return "Could not find this pending update tx";
-
-        auto settle = &this.pending_settle;
-        if (*settle == Settle.init)
-            return "Pending settlement with this channel ID not found";
-
-        update.peer_nonce = peer_nonce;
-        const nonce_pair_pk = update.our_nonce_kp.V + peer_nonce;
-
-        const our_sig = sign(this.kp.v, this.conf.pair_pk,
-            nonce_pair_pk, update.our_nonce_kp.v, update.tx);
-
-        // verify signature first
-        const update_multi_sig = Sig(nonce_pair_pk,
-              Sig.fromBlob(our_sig).s
-            + Sig.fromBlob(peer_sig).s).toBlob();
-
-        const Unlock update_unlock = genKeyUnlock(update_multi_sig);
-        update.tx.inputs[0].unlock = update_unlock;
-
-        // when receiving the update transaction only the funder knows
-        // the full funding transaction definition. Therefore the funder
-        // should send us a non-signed funding tx here.
-        const TestStackMaxTotalSize = 16_384;
-        const TestStackMaxItemSize = 512;
-        scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
-        if (auto error = engine.execute(
-            this.conf.funding_tx.outputs[0].lock, update_unlock,
-            update.tx, update.tx.inputs[0]))
-        {
-            assert(0, error);
-        }
-
-        writefln("%s: receiveUpdateSig(%s) VALIDATED", this.kp.V.prettify,
-            this.conf.chan_id.prettify);
-
-        // this prevents infinite loops, we may want to optimize this
-        if (this.is_owner)
-        {
-            // send the update signature
-            this.send_update_task = this.taskman.schedule(
-            {
-                if (auto error = this.peer.receiveUpdateSig(
-                    this.conf.chan_id, update.our_nonce_kp.V,
-                    our_sig))
-                {
-                    writefln("Error sending update signature back: %s", error);
-                }
-            });
-
-            // also safe to finally send the settlement signature
-            const seq_id_0 = 0;
-            this.send_settle_task = this.taskman.schedule(
-            {
-                if (auto error = this.peer.receiveSettleSig(
-                    this.conf.chan_id, seq_id_0,
-                    settle.our_nonce_kp.V, settle.our_sig))
-                {
-                    writefln("Error sending settlement signature back: %s", error);
-                }
-            });
-
-            // now ok to sign and publish funding tx
-            writefln("%s: Sending funding tx(%s): %s", this.kp.V.prettify,
-                this.conf.chan_id.prettify,
-                this.conf.funding_tx.hashFull.prettify);
-
-            this.taskman.schedule({
-                this.onComplete(UpdatePair.init);  // todo
-            });
-        }
-
-        return null;
     }
 
     /// Cancels any existing tasks and clears the state
@@ -784,24 +702,6 @@ public class Channel
         return null;
     }
 }
-
-/////
-//public struct Update
-//{
-//    Transaction tx;
-//}
-
-/////
-//public struct Settle
-//{
-//    Output[] outputs;
-
-//    /// Our signature
-//    Signature our_sig;
-
-//    /// Peer's signature
-//    Signature peer_sig;
-//}
 
 /// In addition to the Flash API, we provide controller methods to initiate
 /// the channel creation procedures, and control each flash node's behavior.
