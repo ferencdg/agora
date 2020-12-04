@@ -376,19 +376,16 @@ public class SignTask
         {
             tx : createUpdateTx(this.conf, seq_id),
         };
-        this.pending_update = update;
 
         const settle_tx = createSettleTx(update.tx, this.conf.settle_time,
             outputs);
-        const our_settle_sig = this.signSettle(settle_tx);
+
         Settle settle =
         {
             our_nonce_kp : Pair.random(),
             outputs      : outputs.dup,
             tx           : settle_tx,
-            our_sig      : our_settle_sig,
         };
-        this.pending_settle = settle;
 
         // todo: sig should be sent back through requestSettleSig(),
         // that way we don't have to "wait" for a response, but instead we
@@ -748,7 +745,7 @@ public class Channel
             this.peer);
     }
 
-    /// Start routine for the channel funder
+    /// Start routine for the channel
     public void start ()
     {
         assert(this.is_owner);  // only funder initiates the channel
@@ -1003,7 +1000,7 @@ public abstract class FlashNode : FlashAPI
     }
 
     ///
-    public override string requestSettleSig (in Hash chan_id,
+    public override SigResult requestSettleSig (in Hash chan_id,
         in uint seq_id, in Transaction prev_tx, Output[] outputs,
         in Point peer_nonce)
     {
@@ -1011,7 +1008,7 @@ public abstract class FlashNode : FlashAPI
             return channel.requestSettleSig(prev_tx, seq_id, outputs,
                 peer_nonce);
 
-        return "Channel ID not found";
+        return SigResult("Channel ID not found");
     }
 
     ///
