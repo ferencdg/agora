@@ -314,6 +314,7 @@ public class SignTask
         private Transaction tx;
         private Signature our_sig;
         private Signature peer_sig;
+        private bool validated;
     }
 
     private PendingSettle pending_settle;
@@ -352,12 +353,8 @@ public class SignTask
         this.pending_update = this.createPendingUpdate();
         this.pending_settle = this.createPendingSettle(this.pending_update.tx);
 
-        // todo: sig should be sent back through requestSettleSig(),
-        // that way we don't have to "wait" for a response, but instead we
-        // keep polling until we get our information
         auto status = this.peer.requestSettleSig(this.conf.chan_id,
             seq_id);
-
         if (status.error !is null)
         {
             // todo: retry?
@@ -365,15 +362,75 @@ public class SignTask
             assert(0);
         }
 
-        if (auto error = this.processSettleSig(status.sig))
-            assert(0, error);
+        if (auto error = this.isInvalidSettleMultiSig(
+            this.pending_settle, status.sig))
+        {
+            // todo: inform? ban?
+            writefln("Error during validation: %s For signature: %s",
+                error, status.sig);
+            assert(0);
+        }
+        this.pending_settle.peer_sig = status.sig;
+        this.pending_settle.validated = true;
+
+        // here it's a bit problematic because the counter-party will refuse
+        // to reveal their update sig until they receive the settlement signature
+        // todo: could we just share it in the single request API?
+        status = this.peer.requestUpdateSig(this.conf.chan_id,
+            seq_id);
+        if (status.error !is null)
+        {
+            // todo: retry?
+            writefln("Requested settlement rejected: %s", error);
+            assert(0);
+        }
+
+        if (!this.isValidUpdateMultiSig(this.pending_update, status.sig))
+        {
+            // todo: inform? ban?
+            writefln("Received invalid signaturee: %s", status.sig);
+            assert(0);
+        }
+        this.pending_update.peer_sig = status.sig;
+        this.pending_update.validated = true;
 
         // now we have our signature, check it and then request update sig
     }
 
+    private Signature getUpdateSig (in Transaction update_tx)
+    {
+        const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
+
+        // if the current sequence is 0 then the update tx is a trigger tx that
+        // only needs a multi-sig and does not require a sequence.
+        // an update tx with seq 0 do not exist.
+        if (this.seq_id == 0)
+        {
+            return sign(this.kp.v, this.conf.pair_pk, nonce_pair_pk,
+                this.priv_nonce.v, update_tx);
+        }
+        else
+        {
+            const challenge_update = getSequenceChallenge(update_tx,
+                this.seq_id, 0);  // todo: should not be hardcoded
+            return sign(this.kp.v, settle_pair_pk, nonce_pair_pk,
+                this.priv_nonce.settle.v, challenge_settle);
+        }
+    }
+
     private PendingUpdate createPendingUpdate ()
     {
-        createPendingUpdate
+        const update_tx = createUpdateTx(this.conf, seq_id);
+
+
+        PendingUpdate update =
+        {
+            tx        : settle_tx,
+            our_sig   : sig,
+            validated : false,
+        };
+
+        return update;
     }
 
     private PendingSettle createPendingSettle (in Transaction update_tx)
@@ -403,226 +460,92 @@ public class SignTask
         return settle;
     }
 
-    public SigResult requestSettleSig (Output[] outputs)
+    private string isInvalidSettleMultiSig (in PendingSettle settle,
+        in Signature peer_sig)
     {
-        const our_settle_nonce_kp = Pair.random();
-
-        const settle_tx = createSettleTx(prev_tx, this.conf.settle_time,
-            outputs);
-        const uint input_idx = 0;
-        const challenge_settle = getSequenceChallenge(settle_tx, seq_id,
-            input_idx);
-
-        const our_settle_scalar = getSettleScalar(this.kp.v, this.conf.funding_tx_hash,
-            seq_id);
-        const settle_pair_pk = getSettlePk(this.conf.pair_pk, this.conf.funding_tx_hash,
-            seq_id, this.conf.num_peers);
-        const nonce_pair_pk = our_settle_nonce_kp.V + peer_nonce_pk;
-
-        const sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
-            our_settle_nonce_kp.v, challenge_settle);
-
-        // we also expect the counter-party to give us their signature
-        this.pending_settlement = Settlement(
-            this.conf.chan_id, seq_id, our_settle_nonce_kp,
-            peer_nonce_pk,
-            Transaction.init,  // trigger tx is revealed later
-            outputs);
-
-        this.taskman.schedule(
-        {
-            if (auto error = this.peer.receiveSettlementSig(this.conf.chan_id,
-                seq_id, our_settle_nonce_kp.V, sig))
-            {
-                // todo: retry?
-                writefln("Peer rejected settlement tx: %s", error);
-            }
-        });
-
-    }
-
-    // todo: check if we agree with the outputs
-    ///
-    public string processSettleSig (Output[] outputs)
-    {
-        writefln("%s: requestSettleSig(%s)", this.kp.V.prettify,
-            this.conf.chan_id.prettify);
-
-        const our_nonce_kp = Pair.random();
-        const settle_tx = createSettleTx(this.update.tx, this.conf.settle_time,
-            outputs);
-        const uint input_idx = 0;
-        const challenge_settle = getSequenceChallenge(settle_tx, this.seq_id,
-            input_idx);
-
-        const our_settle_scalar = getSettleScalar(this.kp.v,
-            this.conf.funding_tx_hash, this.seq_id);
-        const settle_pair_pk = getSettlePk(this.conf.pair_pk,
-            this.conf.funding_tx_hash, this.seq_id, this.conf.num_peers);
-        const nonce_pair_pk = our_nonce_kp.V + peer_nonce;
-
-        const sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
-            our_nonce_kp.v, challenge_settle);
-
-        return SigResult(null, sig);
-    }
-
-    private string verifySettleSig (in Signature sig)
-    {
-        const settle_sig_pair = Sig(nonce_pair_pk,
-              Sig.fromBlob(our_sig).s
+        const nonce_pair_pk = this.priv_nonce.settle.V + this.peer_nonce.settle;
+        const settle_multi_sig = Sig(nonce_pair_pk,
+              Sig.fromBlob(settle.our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
 
-        if (!verify(settle_pair_pk, settle_sig_pair, challenge_settle))
-            return "Settle signature is invalid";
+        const Unlock settle_unlock = createUnlockSettle(settle_multi_sig,
+            this.seq_id);
+        // todo: should not be hardcoded to idx 0
+        settle.tx.inputs[0].unlock = settle_unlock;
 
-        writefln("%s: receiveSettleSig(%s) VALIDATED for seq id %s",
-            this.kp.V.prettify, this.conf.chan_id.prettify, this.seq_id);
-
-        // unlock script set
-        const Unlock settle_unlock = createUnlockSettle(settle_sig_pair, this.seq_id);
-        settle_tx.inputs[0].unlock = settle_unlock;
-
-        // note: this step may not look necessary but it can fail if there are
-        // any incompatibilities with the script generators and the engine
-        // (e.g. sequence ID being 4 bytes instead of 8)
+        // note: must always use the execution engine to validate and never
+        // try to validate the signatures manually.
         const TestStackMaxTotalSize = 16_384;
         const TestStackMaxItemSize = 512;
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
         if (auto error = engine.execute(
-            settle.prev_tx.outputs[0].lock, settle_unlock, settle_tx,
-                settle_tx.inputs[0]))
+            settle.prev_tx.outputs[0].lock, settle_unlock, settle.tx,
+                settle.tx.inputs[0]))
         {
-            assert(0, error);
+            return error;
         }
 
+        return null;
     }
 
-    private void onSettleComplete ()
+    private Unlock getUpdateUnlock (Signature update_multi_sig)
     {
-        this.request_task = this.taskman.schedule(
-        {
-            const our_nonce_kp = Pair.random();
-            this.pending_update = Update(our_nonce_kp);
-
-            if (auto error = this.peer.requestUpdateSig(this.conf.chan_id,
-                this.seq_id, our_nonce_kp.V, prev_tx))
-            {
-                writefln("Error calling requestUpdateSig(): %s", error);
-            }
-        });
+        // if the current sequence is 0 then the update tx is a trigger tx that
+        // only needs a multi-sig and does not require a sequence.
+        // an update tx with seq 0 do not exist.
+        if (this.seq_id == 0)
+            return genKeyUnlock(update_multi_sig);
+        else
+            return createUnlockUpdate(update_multi_sig, this.seq_id);
     }
 
-    ///
-    public string receiveSettleSig (in Point peer_nonce, in Signature peer_sig)
+    private string isInvalidUpdateMultiSig (in PendingUpdate update,
+        in Signature peer_sig)
     {
-        writefln("%s: receiveSettleSig(%s)", this.kp.V.prettify,
-            this.conf.chan_id.prettify);
-
-        auto settle = &this.pending_settle;
-        settle.peer_nonce = peer_nonce;
-
-        // recreate the settlement tx
-        auto settle_tx = createSettleTx(settle.prev_tx,
-            this.conf.settle_time, settle.outputs);
-        const uint input_idx = 0;
-        const challenge_settle = getSequenceChallenge(settle_tx, this.seq_id,
-            input_idx);
-
-        // todo: send the signature back via receiveSettleSig()
-        // todo: add pending settlement to the other peer's pending settlements
-
-        // Kim received the <settlement, signature> tuple.
-        // he signs it, and finishes the multisig.
-        Pair our_settle_origin_kp;
-        Point peer_settle_origin_pk;
-
-        const our_settle_scalar = getSettleScalar(this.kp.v,
-            this.conf.funding_tx_hash, this.seq_id);
-        const settle_pair_pk = getSettlePk(this.conf.pair_pk,
-            this.conf.funding_tx_hash, this.seq_id, this.conf.num_peers);
-        const nonce_pair_pk = settle.our_nonce_kp.V
-            + settle.peer_nonce;
-
-        const our_sig = sign(our_settle_scalar, settle_pair_pk, nonce_pair_pk,
-            settle.our_nonce_kp.v, challenge_settle);
-        settle.our_sig = our_sig;
-
-        const settle_sig_pair = Sig(nonce_pair_pk,
-              Sig.fromBlob(our_sig).s
+        const nonce_pair_pk = this.priv_nonce.update.V + this.peer_nonce.update;
+        const update_multi_sig = Sig(nonce_pair_pk,
+              Sig.fromBlob(update.our_sig).s
             + Sig.fromBlob(peer_sig).s).toBlob();
 
-        if (!verify(settle_pair_pk, settle_sig_pair, challenge_settle))
-            return "Settle signature is invalid";
+        const Unlock update_unlock = this.getUpdateUnlock(update_multi_sig,
+            this.seq_id);
+        // todo: should not be hardcoded to idx 0
+        update.tx.inputs[0].unlock = update_unlock;
 
-        writefln("%s: receiveSettleSig(%s) VALIDATED for seq id %s",
-            this.kp.V.prettify, this.conf.chan_id.prettify, this.seq_id);
-
-        // unlock script set
-        const Unlock settle_unlock = createUnlockSettle(settle_sig_pair, this.seq_id);
-        settle_tx.inputs[0].unlock = settle_unlock;
-
-        // note: this step may not look necessary but it can fail if there are
-        // any incompatibilities with the script generators and the engine
-        // (e.g. sequence ID being 4 bytes instead of 8)
+        // note: must always use the execution engine to validate and never
+        // try to validate the signatures manually.
         const TestStackMaxTotalSize = 16_384;
         const TestStackMaxItemSize = 512;
         scope engine = new Engine(TestStackMaxTotalSize, TestStackMaxItemSize);
         if (auto error = engine.execute(
-            settle.prev_tx.outputs[0].lock, settle_unlock, settle_tx,
-                settle_tx.inputs[0]))
+            update.prev_tx.outputs[0].lock, update_unlock, update.tx,
+                update.tx.inputs[0]))
         {
-            assert(0, error);
+            return error;
         }
 
         return null;
     }
 
     ///
-    public string requestUpdateSig (in Point peer_nonce,
-        Transaction update_tx)
+    public SigResult requestSettleSig ()
     {
-        writefln("%s: requestUpdateSig(%s)", this.kp.V.prettify,
-            this.conf.chan_id.prettify);
+        // it's always safe to share our settlement signature because
+        // it may only attach to the matching update tx which is signed later.
+        return SigResult(null, this.pending_settle.our_sig);
+    }
 
-        // todo: if this is called again, we should just return the existing
-        // signature which would be encoded in the Update
-        // todo: we should just keep the old signatures in case the other
-        // node needs it (technically we should just return the latest update tx
-        // and the sequence ID)
-        if (this.pending_update != Update.init)
-            return "Error: Multiple calls to requestUpdateSig() not supported";
+    ///
+    public SigResult requestUpdateSig ()
+    {
+        // sharing the update signature prematurely can lead to funds being
+        // permanently locked if the settlement signature is missing and the
+        // update transaction is externalized.
+        if (!this.pending_settle.validated)
+            return SigResult("Cannot share update signature until "
+                ~ "settlement signature is received");
 
-        auto settle = &this.pending_settle;
-        if (*settle == Settle.init)
-            return "Pending settlement with this channel ID not found";
-
-        // todo: the semantics of the trigger tx need to be validated properly
-        if (update_tx.inputs.length == 0)
-            return "Invalid trigger tx";
-
-        const funding_utxo = UTXO.getHash(this.conf.funding_tx_hash, 0);
-        if (update_tx.inputs[0].utxo != funding_utxo)
-            return "Update transaction does not reference the funding tx hash";
-
-        settle.prev_tx = update_tx;
-        const our_nonce_kp = Pair.random();
-        const nonce_pair_pk = our_nonce_kp.V + peer_nonce;
-        const our_sig = sign(this.kp.v, this.conf.pair_pk,
-            nonce_pair_pk, our_nonce_kp.v, update_tx);
-
-        this.pending_update = Update(
-            our_nonce_kp,
-            peer_nonce,
-            update_tx);
-
-        this.send_update_task = this.taskman.schedule(
-        {
-            this.peer.receiveUpdateSig(this.conf.chan_id, this.seq_id,
-                our_nonce_kp.V, our_sig);
-        });
-
-        return null;
+        return SigResult(null, this.pending_update.our_sig);
     }
 
     ///
