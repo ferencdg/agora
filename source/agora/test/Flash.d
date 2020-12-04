@@ -665,7 +665,6 @@ public class Channel
     /// Start routine for the channel
     public void start ()
     {
-        assert(this.is_owner);  // only funder initiates the channel
         assert(this.stage == Stage.Setup);
         assert(this.cur_seq_id == 0);
 
@@ -702,11 +701,16 @@ public class Channel
         else
             this.stage = Stage.WaitForFunding;
 
-        this.funding_tx_signed = this.conf.funding_tx.clone();
-        this.funding_tx_signed.inputs[0].unlock
-            = genKeyUnlock(sign(this.kp, this.conf.funding_tx));
+        // if we're the funder then it's time to publish the funding tx
+        if (this.is_owner)
+        {
+            this.funding_tx_signed = this.conf.funding_tx.clone();
+            this.funding_tx_signed.inputs[0].unlock
+                = genKeyUnlock(sign(this.kp, this.conf.funding_tx));
 
-        this.txPublisher(this.funding_tx_signed);
+            this.txPublisher(this.funding_tx_signed);
+        }
+
         this.sign_task.clearState();
 
         this.channel_updates ~= update_pair;
@@ -811,15 +815,6 @@ public abstract class FlashNode : FlashAPI
     {
         writefln("%s: openChannel()", this.kp.V.prettify);
 
-        // todo: funding amount should be drived from the `funding_tx`
-        // and not passed explicitly, else we would have to validate this.
-        // add a sumOutputs thingy here.
-        // todo: verify Outputs[] sum is equal to `funding_amoutn`
-        // todo: verify `chan_conf.peer_pk` equals our own!
-
-        // todo: need replay attack protection. adversary could feed us
-        // a dupe temporary channel ID once it's removed from
-        // `this.channels`
         if (chan_conf.chan_id in this.channels)
             return OpenResult("There is already an open channel with this ID");
 
