@@ -383,7 +383,6 @@ unittest
 
 *******************************************************************************/
 
-version (unittest)
 public ubyte[] toPushOpcode (in ubyte[] data) pure nothrow @safe
 {
     assert(data.length > 0);
