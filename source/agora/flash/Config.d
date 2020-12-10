@@ -57,6 +57,9 @@ public struct ChannelConfig
     /// Hash of the funding transaction above.
     public Hash funding_tx_hash;
 
+    /// The utxo that will actually be spent from the funding tx (just index 0)
+    public Hash funding_utxo;
+
     /// The total amount funded in this channel. This information is
     /// derived from the Outputs of the funding transaction.
     public Amount funding_amount;

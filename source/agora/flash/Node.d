@@ -89,6 +89,7 @@ public abstract class FlashNode : FlashAPI
     public override Result!PublicNonce openChannel (in ChannelConfig chan_conf,
         in PublicNonce peer_nonce)
     {
+        // todo: verify `chan_conf.funding_utxo`
         writefln("%s: openChannel()", this.kp.V.prettify);
 
         if (chan_conf.chan_id in this.channels)

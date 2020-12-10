@@ -73,6 +73,9 @@ public class Channel
     /// The list of any off-chain updates which happened on this channel
     private UpdatePair[] channel_updates;
 
+    /// Valid when `channel_updates` is not empty, used for the watchtower
+    private Hash trigger_utxo;
+
     /// The current sequence ID
     private uint cur_seq_id;
 
@@ -246,6 +249,7 @@ public class Channel
             this.txPublisher(this.funding_tx_signed);
         }
 
+        this.trigger_utxo = hashMulti(update_pair.update_tx.hashFull(), 0);
         this.channel_updates ~= update_pair;
     }
 
@@ -497,6 +501,9 @@ public class Channel
     {
         foreach (tx; block.txs)
         {
+            if (block.header.height == Height(10))
+                writefln("is %s update: %s", tx.hashFull(), this.isUpdateTx(tx));
+
             if (tx.hashFull() == this.conf.funding_tx_hash)
             {
                 writefln("%s: Funding tx externalized(%s)",
@@ -511,11 +518,13 @@ public class Channel
                 this.onUpdateTxExternalized(tx);
             }
             else
-            if (this.isSettleTx(tx))
             {
-                writefln("%s: Settle tx externalized(%s)",
-                    this.kp.V.prettify, tx.hashFull());
-                this.onSettleTxExternalized(tx);
+                if (this.isSettleTx(tx))
+                {
+                    writefln("%s: Settle tx externalized(%s)",
+                        this.kp.V.prettify, tx.hashFull());
+                    this.onSettleTxExternalized(tx);
+                }
             }
         }
     }
@@ -525,13 +534,14 @@ public class Channel
         if (tx.inputs.length != 1)
             return false;
 
-        if (tx.inputs[0].utxo == this.conf.funding_tx_hash)
+        if (tx.inputs[0].utxo == this.conf.funding_utxo)
             return true;
 
         // todo: could there be a timing issue here if our `channel_updates`
         // are not updated fast enough? chances are very slim, need to verify.
-        return this.channel_updates.length > 0 &&
-            tx.inputs[0].utxo == this.channel_updates[0].update_tx.inputs[0].utxo;
+        // todo: optimize by caching trigger tx utxo
+        return this.channel_updates.length > 0
+            && tx.inputs[0].utxo == this.trigger_utxo;
     }
 
     private bool isSettleTx (in Transaction tx)

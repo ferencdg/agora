@@ -1,3 +1,5 @@
+todo: move watchtower stuff.. into a Watchtower class?
+
 todo: handle pendingclosed and closed
 todo: make sure that we are not catching up when we try to determine
 if the funding tx of our channel has "just now" been exernalized

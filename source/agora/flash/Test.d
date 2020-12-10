@@ -113,6 +113,7 @@ public class ControlFlashNode : FlashNode, ControlAPI
             update_pair_pk  : getUpdatePk(pair_pk, funding_tx_hash, num_peers),
             funding_tx      : funding_tx,
             funding_tx_hash : funding_tx_hash,
+            funding_utxo    : UTXO.getHash(funding_tx.hashFull(), 0),
             funding_amount  : funding_amount,
             settle_time     : settle_time,
         };
@@ -257,7 +258,7 @@ unittest
 
     auto nodes = network.clients;
     auto node_1 = nodes[0];
-    scope (failure) node_1.printLog();
+    //scope (failure) node_1.printLog();
 
     // split the genesis funds into WK.Keys[0] .. WK.Keys[7]
     auto txs = genesisSpendable().take(8).enumerate()
@@ -315,7 +316,7 @@ unittest
     network.expectBlock(Height(11), network.blocks[0].header);
 
     Thread.sleep(1.seconds);
-    node_1.printLog();
+    //node_1.printLog();
     //alice.ctrlPublishSettle(chan_id, 1);
 
     //// now we publish trigger tx
