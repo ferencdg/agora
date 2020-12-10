@@ -181,3 +181,10 @@ public string prettify (T)(T input)
 {
     return input.to!string[0 .. 6];
 }
+
+/// ditto
+public T clone (T)(in T input)
+{
+    import agora.common.Serializer;
+    return input.serializeFull.deserializeFull!T;
+}

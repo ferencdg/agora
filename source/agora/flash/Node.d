@@ -55,8 +55,6 @@ public abstract class FlashNode : FlashAPI
     /// to a Channel with a unique ID derived from the hash of the funding tx.
     protected Channel[Hash] channels;
 
-    protected bool ready_to_externalize;
-
     protected bool ready_to_close;
 
     /// Ctor
@@ -75,11 +73,16 @@ public abstract class FlashNode : FlashAPI
         this.agora_node = new RemoteAPI!TestAPI(tid, timeout);
     }
 
+    ///
+    public void start ()
+    {
+        this.taskman.setTimer(200.msecs, &this.monitorBlockchain, Periodic.Yes);
+    }
+
     /// publishes a transaction to the blockchain
     protected void txPublisher (in Transaction tx)
     {
         this.agora_node.putTransaction(cast()tx);
-        this.ready_to_externalize = true;
     }
 
     ///
@@ -215,34 +218,40 @@ public abstract class FlashNode : FlashAPI
     /// If we have the funding tx, and the signatures for the trigger and
     /// settlement transaction, it means the channel is open and may
     /// be promoted to a full channel.
-    public void listenFundingEvent ()
+    private void monitorBlockchain ()
     {
         // todo: we actually need a getUTXO API
         // we would probably have to contact Stoa,
         // for now we simulate it through getBlocksFrom(),
         // we could provide this in the TestAPI
+        static ulong last_read_height = 0;
 
-        auto last_block = this.agora_node.getBlocksFrom(0, 1024)[$ - 1];
-
-        Hash[] pending_chans_to_remove;
-        foreach (hash, ref channel; this.channels)
+        while (1)
         {
-            if (!channel.isWaitingForFunding())
-                continue;
-
-            foreach (tx; last_block.txs)
+            auto latest_height = this.agora_node.getBlockHeight();
+            if (last_read_height < latest_height)
             {
-                if (tx.hashFull() == channel.conf.funding_tx_hash)
-                {
-                    channel.onFundingTxExternalized(tx);
-                    writefln("%s: Funding tx externalized(%s)",
-                        this.kp.V.prettify, channel.conf.funding_tx_hash);
-                    break;
-                }
-            }
-        }
+                auto next_block = this.agora_node.getBlocksFrom(
+                    last_read_height + 1, 1)[0];
 
-        foreach (id; pending_chans_to_remove)
-            this.channels.remove(id);
+                foreach (channel; this.channels)
+                {
+                    foreach (tx; next_block.txs)
+                    {
+                        if (tx.hashFull() == channel.conf.funding_tx_hash)
+                        {
+                            channel.onFundingTxExternalized(tx);
+                            writefln("%s: Funding tx externalized(%s)",
+                                this.kp.V.prettify, channel.conf.funding_tx_hash);
+                            break;
+                        }
+                    }
+                }
+
+                last_read_height++;
+            }
+
+            this.taskman.wait(0.msecs);
+        }
     }
 }

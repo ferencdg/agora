@@ -227,6 +227,7 @@ public class Channel
             this.funding_tx_signed.inputs[0].unlock
                 = genKeyUnlock(sign(this.kp, this.conf.funding_tx));
 
+            writeln("Publishing funding tx..");
             this.txPublisher(this.funding_tx_signed);
         }
 
@@ -478,14 +479,21 @@ public class Channel
 
     ***************************************************************************/
 
-    public UpdatePair beginUnilateralClose ()
+    public void beginUnilateralClose ()
     {
         // todo: should only be called once
         assert(this.state == ChannelState.Open);
         this.state = ChannelState.PendingClose;
 
         // publish the trigger transaction
-        return this.channel_updates[0];
+        const trigger_tx = this.channel_updates[0].update_tx;
+        writefln("Publishing trigger tx: %s", trigger_tx.hashFull());
+        this.txPublisher(trigger_tx);
+
+        // settlement cannot be published yet (relative time lock rejected)
+        const settle_tx = this.channel_updates[0].settle_tx;
+        writefln("Publishing settle tx: %s", settle_tx.hashFull());
+        this.txPublisher(settle_tx);
     }
 
     /***************************************************************************
@@ -580,11 +588,4 @@ public class Channel
             format("Sequence ID %s does not match our latest ID %s.",
                 seq_id, this.cur_seq_id));
     }
-}
-
-/// utility
-private T clone (T)(in T input)
-{
-    import agora.common.Serializer;
-    return input.serializeFull.deserializeFull!T;
 }
