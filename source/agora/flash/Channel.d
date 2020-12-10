@@ -293,7 +293,8 @@ public class Channel
         if (tx == this.channel_updates[$ - 1].update_tx)
         {
             const settle_tx = this.channel_updates[$ - 1].settle_tx;
-            writefln("Publishing last settle tx: %s", settle_tx.hashFull());
+            writefln("Publishing last settle tx %s: %s",
+                this.channel_updates.length, settle_tx.hashFull());
             this.txPublisher(settle_tx);
         }
         else
@@ -301,8 +302,8 @@ public class Channel
             // either the trigger or an outdated update tx was published.
             // publish the latest update first.
             const update_tx = this.channel_updates[$ - 1].update_tx;
-            writefln("Publishing latest update tx: %s",
-                update_tx.hashFull());
+            writefln("Publishing latest update tx %s: %s",
+                this.channel_updates.length, update_tx.hashFull());
             this.txPublisher(update_tx);
         }
     }
@@ -455,7 +456,7 @@ public class Channel
             new_balance, priv_nonce, peer_nonce,
             this.channel_updates[0].update_tx);  // spend from trigger tx
 
-        writefln("%s: Got new update pair!", this.kp.V.prettify);
+        writefln("%s: Got new pair!", this.kp.V.prettify);
         this.channel_updates ~= update_pair;
         this.cur_balance.outputs = new_balance.outputs.dup;
     }
@@ -475,8 +476,6 @@ public class Channel
 
     public void onBlockExternalized (in Block block)
     {
-        writefln("Block externalized: %s", block.hashFull());
-
         foreach (tx; block.txs)
         {
             if (tx.hashFull() == this.conf.funding_tx_hash)
@@ -504,15 +503,16 @@ public class Channel
 
     private bool isUpdateTx (in Transaction tx)
     {
-        // spend from the trigger tx
-        if (this.channel_updates.length > 0 &&
-            tx.inputs ==
-                [Input(this.channel_updates[0].update_tx, 0 /* index */, 0 /* unlock age */)])
+        if (tx.inputs.length != 1)
+            return false;
+
+        if (tx.inputs[0].utxo == this.conf.funding_tx_hash)
             return true;
 
-        // spend from the funding tx
-        return tx.inputs ==
-            [Input(this.conf.funding_tx, 0 /* index */, 0 /* unlock age */)];
+        // todo: could there be a timing issue here if our `channel_updates`
+        // are not updated fast enough? chances are very slim, need to verify.
+        return this.channel_updates.length > 0 &&
+            tx.inputs[0].utxo == this.channel_updates[0].update_tx.inputs[0].utxo;
     }
 
     private bool isSettleTx (in Transaction tx)
