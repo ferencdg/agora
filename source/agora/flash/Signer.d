@@ -108,14 +108,17 @@ public class Signer
     // todo: this can be a blocking call
     /// priv_nonce = The private nonce we'll use for this signing session
     /// peer_nonce = The nonce we expect the peer to use for this signing session
+    /// prev_tx = initially the funding transaction, subsequently the trigger tx
     public UpdatePair collectSignatures (in uint seq_id, in Balance balance,
-        PrivateNonce priv_nonce, PublicNonce peer_nonce)
+        in PrivateNonce priv_nonce, in PublicNonce peer_nonce,
+        in Transaction prev_tx)
     {
         scope (exit) this.clearState();
         this.seq_id = seq_id;
         this.is_collecting = true;
 
-        this.pending_update = this.createPendingUpdate(priv_nonce, peer_nonce);
+        this.pending_update = this.createPendingUpdate(priv_nonce, peer_nonce,
+            prev_tx);
         this.pending_settle = this.createPendingSettle(this.pending_update.tx,
             balance, priv_nonce, peer_nonce);
 
@@ -140,6 +143,9 @@ public class Signer
         }
         this.pending_settle.peer_sig = settle_res.value;
         this.pending_settle.validated = true;
+
+        // todo: work around this timing issue
+        this.taskman.wait(500.msecs);
 
         // here it's a bit problematic because the counter-party will refuse
         // to reveal their update sig until they receive the settlement signature
@@ -206,9 +212,9 @@ public class Signer
     }
 
     private PendingUpdate createPendingUpdate (in PrivateNonce priv_nonce,
-        in PublicNonce peer_nonce)
+        in PublicNonce peer_nonce, in Transaction prev_tx)
     {
-        auto update_tx = createUpdateTx(this.conf, seq_id);
+        auto update_tx = createUpdateTx(this.conf, seq_id, prev_tx);
         const sig = this.getUpdateSig(update_tx, priv_nonce, peer_nonce);
 
         PendingUpdate update =

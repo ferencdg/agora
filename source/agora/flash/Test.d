@@ -238,11 +238,12 @@ unittest
     auto network = makeTestNetwork(conf);
     network.start();
     scope (exit) network.shutdown();
-    scope (failure) network.printLogs();
+    //scope (failure) network.printLogs();
     network.waitForDiscovery();
 
     auto nodes = network.clients;
     auto node_1 = nodes[0];
+    scope (failure) node_1.printLog();
 
     // split the genesis funds into WK.Keys[0] .. WK.Keys[7]
     auto txs = genesisSpendable().take(8).enumerate()
@@ -282,19 +283,22 @@ unittest
     const block_9 = node_1.getBlocksFrom(9, 1)[$ - 1];
     assert(block_9.txs.any!(tx => tx.hashFull() == chan_id));
 
+    // wait for the parties to detect the funding tx
     alice.ctrlWaitFunding(chan_id);
     bob.ctrlWaitFunding(chan_id);
 
+    // do some off-chain transactions
     alice.ctrlUpdateBalance(chan_id, Amount(10_000), Amount(5_000));
     alice.ctrlUpdateBalance(chan_id, Amount(9_000),  Amount(6_000));
     alice.ctrlUpdateBalance(chan_id, Amount(8_000),  Amount(7_000));
 
+    // alice is bad
     writefln("Alice unilaterally closing the channel..");
     alice.ctrlPublishUpdate(chan_id, 0);
-    network.expectBlock(Height(11), network.blocks[0].header);
+    network.expectBlock(Height(10), network.blocks[0].header);
 
     alice.ctrlPublishUpdate(chan_id, 1);
-    network.expectBlock(Height(12), network.blocks[0].header);
+    network.expectBlock(Height(11), network.blocks[0].header);
 
     //// now we publish trigger tx
     //const block_2 = node_1.getBlocksFrom(0, 1024)[$ - 1];

@@ -193,7 +193,7 @@ public Transaction createClosingTx (in Hash utxo, in Balance balance)
 
 ///
 public Transaction createUpdateTx (in ChannelConfig chan_conf,
-    in uint seq_id) nothrow @safe
+    in uint seq_id, in Transaction prev_tx) nothrow @safe
 {
     const Lock = createFlashLock(chan_conf.settle_time,
         chan_conf.funding_tx_hash, chan_conf.pair_pk, seq_id,
@@ -201,7 +201,7 @@ public Transaction createUpdateTx (in ChannelConfig chan_conf,
 
     Transaction update_tx = {
         type: TxType.Payment,
-        inputs: [Input(chan_conf.funding_tx, 0 /* index */, 0 /* unlock age */)],
+        inputs: [Input(prev_tx, 0 /* index */, 0 /* unlock age */)],
         outputs: [
             Output(chan_conf.funding_amount, Lock)]
     };

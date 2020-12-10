@@ -600,7 +600,7 @@ public class FullNode : API
     public override void receivePreimage (PreImageInfo preimage) @safe
     {
         this.endpoint_request_stats.increaseMetricBy!"agora_endpoint_calls_total"(1, "receive_preimage", "http");
-        log.trace("Received Preimage: {}", prettify(preimage));
+        //log.trace("Received Preimage: {}", prettify(preimage));
 
         if (this.enroll_man.addPreimage(preimage))
         {

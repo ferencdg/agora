@@ -27,6 +27,7 @@ import agora.common.crypto.Schnorr;
 import agora.common.Hash;
 import agora.common.Task;
 import agora.common.Types;
+import agora.consensus.data.Block;
 import agora.consensus.data.UTXO;
 import agora.consensus.data.Transaction;
 import agora.script.Lock;
@@ -182,7 +183,7 @@ public class Channel
             PublicKey(this.conf.funder_pk[]))]);
 
         auto pair = this.signer.collectSignatures(seq_id, balance, priv_nonce,
-            peer_nonce);
+            peer_nonce, this.conf.funding_tx);
         this.onSetupComplete(pair);
     }
 
@@ -451,12 +452,26 @@ public class Channel
 
         this.cur_seq_id++;
         auto update_pair = this.signer.collectSignatures(this.cur_seq_id,
-            new_balance, priv_nonce, peer_nonce);
+            new_balance, priv_nonce, peer_nonce,
+            this.channel_updates[0].update_tx);  // spend from trigger tx
 
         writefln("%s: Got new update pair!", this.kp.V.prettify);
         this.channel_updates ~= update_pair;
         this.cur_balance.outputs = new_balance.outputs.dup;
     }
+
+    /***************************************************************************
+
+        Called when a new block has been externalized.
+
+        Checks if the block contains funding / trigger / update / settlement
+        transactions which belong to this channel, and calls one of the
+        handler routines based on the detected transaction type.
+
+        Params:
+            block = the newly externalized block
+
+    ***************************************************************************/
 
     public void onBlockExternalized (in Block block)
     {
@@ -465,21 +480,21 @@ public class Channel
             if (tx.hashFull() == this.conf.funding_tx_hash)
             {
                 writefln("%s: Funding tx externalized(%s)",
-                    this.kp.V.prettify, channel.conf.funding_tx_hash);
+                    this.kp.V.prettify, tx.hashFull());
                 this.onFundingTxExternalized(tx);
             }
             else
             if (this.isUpdateTx(tx))
             {
                 writefln("%s: Update tx externalized(%s)",
-                    this.kp.V.prettify, channel.conf.funding_tx_hash);
+                    this.kp.V.prettify, tx.hashFull());
                 this.onUpdateTxExternalized(tx);
             }
             else
             if (this.isSettleTx(tx))
             {
                 writefln("%s: Settle tx externalized(%s)",
-                    this.kp.V.prettify, channel.conf.funding_tx_hash);
+                    this.kp.V.prettify, tx.hashFull());
                 this.onSettleTxExternalized(tx);
             }
         }
@@ -556,7 +571,7 @@ public class Channel
     {
         assert(this.channel_updates.length > index + 1);
         const update_tx = this.channel_updates[index].update_tx;
-        writefln("Publishing update tx: %s", update_tx.hashFull());
+        writefln("Publishing update tx %s: %s", index, update_tx.hashFull());
         this.txPublisher(update_tx);
     }
 
