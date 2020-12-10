@@ -432,8 +432,8 @@ extern(D):
         const cur_height = this.ledger.getBlockHeight();
         if (envelope.statement.slotIndex <= cur_height)
         {
-            log.trace("Ignoring envelope with outdated slot #{} (ledger: #{})",
-                envelope.statement.slotIndex, cur_height);
+            //log.trace("Ignoring envelope with outdated slot #{} (ledger: #{})",
+            //    envelope.statement.slotIndex, cur_height);
             return;  // slot was already externalized, ignore outdated message
         }
 

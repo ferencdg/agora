@@ -249,7 +249,7 @@ public class Channel
             this.txPublisher(this.funding_tx_signed);
         }
 
-        this.trigger_utxo = hashMulti(update_pair.update_tx.hashFull(), 0);
+        this.trigger_utxo = UTXO.getHash(update_pair.update_tx.hashFull(), 0);
         this.channel_updates ~= update_pair;
     }
 
@@ -463,6 +463,8 @@ public class Channel
         writefln("%s: updateBalance(%s)", this.kp.V.prettify,
             seq_id);
 
+        // todo: assert that the new balance doesn't overspend
+
         assert(this.state == ChannelState.Open);
 
         // todo: dupe calls should be handled somewhere, so maybe we
@@ -501,8 +503,12 @@ public class Channel
     {
         foreach (tx; block.txs)
         {
-            if (block.header.height == Height(10))
-                writefln("is %s update: %s", tx.hashFull(), this.isUpdateTx(tx));
+            if (block.header.height == Height(11))
+            {
+                writefln("is %s update: %s utxo %s trigger utxo %s",
+                    tx.hashFull(), this.isUpdateTx(tx), tx.inputs[0].utxo,
+                    this.trigger_utxo);
+            }
 
             if (tx.hashFull() == this.conf.funding_tx_hash)
             {

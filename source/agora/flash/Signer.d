@@ -125,6 +125,9 @@ public class Signer
         this.pending_settle = this.createPendingSettle(this.pending_update.tx,
             balance, priv_nonce, peer_nonce);
 
+        // todo: absolutely required to validate the settlement against the
+        // update
+
         // todo: work around this timing issue
         this.taskman.wait(500.msecs);
 
