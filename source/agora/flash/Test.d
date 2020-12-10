@@ -258,7 +258,7 @@ unittest
 
     auto nodes = network.clients;
     auto node_1 = nodes[0];
-    //scope (failure) node_1.printLog();
+    scope (failure) node_1.printLog();
 
     // split the genesis funds into WK.Keys[0] .. WK.Keys[7]
     auto txs = genesisSpendable().take(8).enumerate()
@@ -315,7 +315,10 @@ unittest
     // at this point bob will automatically publish the latest update tx
     network.expectBlock(Height(11), network.blocks[0].header);
 
-    Thread.sleep(1.seconds);
+    // and then a settlement will be published (but only after time lock expires)
+    network.expectBlock(Height(12), network.blocks[0].header);
+
+    //Thread.sleep(1.seconds);
     //node_1.printLog();
     //alice.ctrlPublishSettle(chan_id, 1);
 
