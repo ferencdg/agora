@@ -475,6 +475,8 @@ public class Channel
 
     public void onBlockExternalized (in Block block)
     {
+        writefln("Block externalized: %s", block.hashFull());
+
         foreach (tx; block.txs)
         {
             if (tx.hashFull() == this.conf.funding_tx_hash)
@@ -502,15 +504,20 @@ public class Channel
 
     private bool isUpdateTx (in Transaction tx)
     {
-        // matches createUpdateTx().
-        // we don't have to worry about matching anything else,
-        // this is the exact layout of the input
+        // spend from the trigger tx
+        if (this.channel_updates.length > 0 &&
+            tx.inputs ==
+                [Input(this.channel_updates[0].update_tx, 0 /* index */, 0 /* unlock age */)])
+            return true;
+
+        // spend from the funding tx
         return tx.inputs ==
             [Input(this.conf.funding_tx, 0 /* index */, 0 /* unlock age */)];
     }
 
     private bool isSettleTx (in Transaction tx)
     {
+        // todo: how do we reliably detect our settlement tx?
         return false;
     }
 

@@ -300,6 +300,8 @@ unittest
     alice.ctrlPublishUpdate(chan_id, 1);
     network.expectBlock(Height(11), network.blocks[0].header);
 
+    //alice.ctrlPublishSettle(chan_id, 1);
+
     //// now we publish trigger tx
     //const block_2 = node_1.getBlocksFrom(0, 1024)[$ - 1];
 
