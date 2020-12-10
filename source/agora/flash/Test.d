@@ -311,9 +311,11 @@ unittest
     alice.ctrlPublishUpdate(chan_id, 0);
     network.expectBlock(Height(10), network.blocks[0].header);
 
-    alice.ctrlPublishUpdate(chan_id, 1);
+    // at this point bob will automatically publish the latest update tx
     network.expectBlock(Height(11), network.blocks[0].header);
 
+    Thread.sleep(1.seconds);
+    node_1.printLog();
     //alice.ctrlPublishSettle(chan_id, 1);
 
     //// now we publish trigger tx
