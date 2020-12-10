@@ -16,10 +16,10 @@ module agora.flash.ErrorCode;
 /// All possible error codes for the return value
 public enum ErrorCode : ushort
 {
-    /// No error
+    /// No error.
     None = 0,
 
-    /// Requested an update transaction before the matching settlement was signed
+    /// Requested an update transaction before the matching settlement was signed.
     SettleNotReceived,
 
     /// This sequence ID was not agreed upon, or it's outdated.
@@ -47,6 +47,10 @@ public enum ErrorCode : ushort
     FundingTooLow,
 
     /// A new balance update request cannot be made until the active signing
-    /// process is complete
+    /// process is complete.
     SigningInProcess,
+
+    /// The new balance request has been rejected, e.g. trying to spend more
+    /// than allocated in the funding transaction.
+    RejectedBalanceRequest,
 }

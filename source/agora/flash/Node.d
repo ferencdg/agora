@@ -191,6 +191,11 @@ public abstract class FlashNode : FlashAPI
                 "This channel is still collecting signatures for a "
                 ~ "previous sequence ID");
 
+        if (!channel.canAcceptBalance(balance_req.balance))
+            return Result!PublicNonce(ErrorCode.RejectedBalanceRequest,
+                format("Channel rejects balance request: %s",
+                    balance_req.balance));
+
         // todo: need to add sequence ID verification here
         // todo: add logic if we agree with the new balance
         // todo: check sums for the balance so it doesn't exceed

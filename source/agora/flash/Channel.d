@@ -32,6 +32,7 @@ import agora.consensus.data.UTXO;
 import agora.consensus.data.Transaction;
 import agora.script.Lock;
 
+import std.algorithm;
 import std.format;
 import std.stdio;  // todo: remove
 
@@ -435,6 +436,27 @@ public class Channel
             return Result!Signature(ErrorCode.InvalidSequenceID);
 
         return this.signer.getUpdateSig();
+    }
+
+    /***************************************************************************
+
+        Checks whether the new balance is acceptable.
+
+        Returns:
+            true if the new balance is less than or equal to the funding amount.
+
+    ***************************************************************************/
+
+    public bool canAcceptBalance (in Balance new_balance)
+    {
+        Amount total_balance;
+        foreach (output; new_balance.outputs)
+        {
+            if (!total_balance.add(output.value))
+                return false;  // overflow
+        }
+
+        return total_balance <= this.conf.funding_amount;
     }
 
     /***************************************************************************

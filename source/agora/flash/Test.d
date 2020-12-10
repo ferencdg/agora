@@ -302,10 +302,14 @@ unittest
     alice.ctrlWaitFunding(chan_id);
     bob.ctrlWaitFunding(chan_id);
 
-    // do some off-chain transactions
-    alice.ctrlUpdateBalance(chan_id, Amount(10_000), Amount(5_000));
-    alice.ctrlUpdateBalance(chan_id, Amount(9_000),  Amount(6_000));
-    alice.ctrlUpdateBalance(chan_id, Amount(8_000),  Amount(7_000));
+    /* do some off-chain transactions */
+
+    // todo: this would error because it's overspending, re-add the test later
+    // alice.ctrlUpdateBalance(chan_id, Amount(10_000), Amount(5_000));
+
+    alice.ctrlUpdateBalance(chan_id, Amount(5_000),  Amount(5_000));
+    alice.ctrlUpdateBalance(chan_id, Amount(4_000),  Amount(6_000));
+    alice.ctrlUpdateBalance(chan_id, Amount(6_000),  Amount(4_000));
 
     // alice is bad
     writefln("Alice unilaterally closing the channel..");
