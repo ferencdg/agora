@@ -236,6 +236,35 @@ public class Channel
 
     /***************************************************************************
 
+        Called when the funding transaction of this channel has been
+        externalized in the blockchain.
+
+        The state of this channel will change to `Open`, which will make make
+        the channel open to receiving new balance update requests - which it
+        may accept or deny based on whether all the channel parties agree
+        to the new balance update request.
+
+        Params:
+            tx = the funding transaction. Must be equal to the hash of the
+                funding transaction as set up in the initial `openChannel`
+                call - otherwise it's ignored.
+
+    ***************************************************************************/
+
+    private void onFundingTxExternalized (in Transaction tx)
+    {
+        this.funding_tx_signed = tx.clone();
+        if (this.state == ChannelState.WaitingForFunding)
+            this.state = ChannelState.Open;
+
+        // todo: assert that this is really the actual balance
+        // it shouldn't be technically possible that it mismatches
+        this.cur_balance = Balance([Output(this.conf.funding_amount,
+            PublicKey(this.conf.funder_pk[]))]);
+    }
+
+    /***************************************************************************
+
         Called when the trigger / update transaction of this channel has been
         either detected in one of the nodes' transaction pools, or
         if it was externalized in the blockchain.
@@ -258,38 +287,23 @@ public class Channel
     public void onUpdateTxExternalized (in Transaction tx)
     {
         this.state = ChannelState.PendingClose;
-    }
 
-    /***************************************************************************
-
-        Called when the funding transaction of this channel has been
-        externalized in the blockchain.
-
-        The state of this channel will change to `Open`, which will make make
-        the channel open to receiving new balance update requests - which it
-        may accept or deny based on whether all the channel parties agree
-        to the new balance update request.
-
-        Params:
-            tx = the funding transaction. Must be equal to the hash of the
-                funding transaction as set up in the initial `openChannel`
-                call - otherwise it's ignored.
-
-    ***************************************************************************/
-
-    public void onFundingTxExternalized (in Transaction tx)
-    {
-        if (hashFull(tx) != this.conf.funding_tx_hash)
-            return;  // todo: diagnostic?
-
-        this.funding_tx_signed = tx.clone();
-        if (this.state == ChannelState.WaitingForFunding)
-            this.state = ChannelState.Open;
-
-        // todo: assert that this is really the actual balance
-        // it shouldn't be technically possible that it mismatches
-        this.cur_balance = Balance([Output(this.conf.funding_amount,
-            PublicKey(this.conf.funder_pk[]))]);
+        // last update was published, publish just the settlement
+        if (tx == this.channel_updates[$ - 1].update_tx)
+        {
+            const settle_tx = this.channel_updates[$ - 1].settle_tx;
+            writefln("Publishing last settle tx: %s", settle_tx.hashFull());
+            this.txPublisher(settle_tx);
+        }
+        else
+        {
+            // either the trigger or an outdated update tx was published.
+            // publish the latest update first.
+            const update_tx = this.channel_updates[$ - 1].update_tx;
+            writefln("Publishing latest update tx: %s",
+                update_tx.hashFull());
+            this.txPublisher(update_tx);
+        }
     }
 
     /***************************************************************************
@@ -305,7 +319,7 @@ public class Channel
 
     ***************************************************************************/
 
-    public void onClosingTxExternalized (in Transaction tx)
+    private void onClosingTxExternalized (in Transaction tx)
     {
         // todo: assert this is the actual closing transaction
         this.state = ChannelState.Closed;
@@ -353,7 +367,7 @@ public class Channel
 
     ***************************************************************************/
 
-    public void onSettleTxExternalized (in Transaction tx)
+    private void onSettleTxExternalized (in Transaction tx)
     {
         // todo: assert this is the actual closing transaction
         this.state = ChannelState.Closed;
@@ -444,6 +458,47 @@ public class Channel
         this.cur_balance.outputs = new_balance.outputs.dup;
     }
 
+    public void onBlockExternalized (in Block block)
+    {
+        foreach (tx; block.txs)
+        {
+            if (tx.hashFull() == this.conf.funding_tx_hash)
+            {
+                writefln("%s: Funding tx externalized(%s)",
+                    this.kp.V.prettify, channel.conf.funding_tx_hash);
+                this.onFundingTxExternalized(tx);
+            }
+            else
+            if (this.isUpdateTx(tx))
+            {
+                writefln("%s: Update tx externalized(%s)",
+                    this.kp.V.prettify, channel.conf.funding_tx_hash);
+                this.onUpdateTxExternalized(tx);
+            }
+            else
+            if (this.isSettleTx(tx))
+            {
+                writefln("%s: Settle tx externalized(%s)",
+                    this.kp.V.prettify, channel.conf.funding_tx_hash);
+                this.onSettleTxExternalized(tx);
+            }
+        }
+    }
+
+    private bool isUpdateTx (in Transaction tx)
+    {
+        // matches createUpdateTx().
+        // we don't have to worry about matching anything else,
+        // this is the exact layout of the input
+        return tx.inputs ==
+            [Input(this.conf.funding_tx, 0 /* index */, 0 /* unlock age */)];
+    }
+
+    private bool isSettleTx (in Transaction tx)
+    {
+        return false;
+    }
+
     /***************************************************************************
 
         Begin a unilateral closure of the channel.
@@ -494,6 +549,15 @@ public class Channel
         const settle_tx = this.channel_updates[0].settle_tx;
         writefln("Publishing settle tx: %s", settle_tx.hashFull());
         this.txPublisher(settle_tx);
+    }
+
+    version (unittest)
+    public void ctrlPublishUpdate (uint index)
+    {
+        assert(this.channel_updates.length > index + 1);
+        const update_tx = this.channel_updates[index].update_tx;
+        writefln("Publishing update tx: %s", update_tx.hashFull());
+        this.txPublisher(update_tx);
     }
 
     /***************************************************************************

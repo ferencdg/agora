@@ -235,18 +235,7 @@ public abstract class FlashNode : FlashAPI
                     last_read_height + 1, 1)[0];
 
                 foreach (channel; this.channels)
-                {
-                    foreach (tx; next_block.txs)
-                    {
-                        if (tx.hashFull() == channel.conf.funding_tx_hash)
-                        {
-                            channel.onFundingTxExternalized(tx);
-                            writefln("%s: Funding tx externalized(%s)",
-                                this.kp.V.prettify, channel.conf.funding_tx_hash);
-                            break;
-                        }
-                    }
-                }
+                    channel.onBlockExternalized(next_block);
 
                 last_read_height++;
             }

@@ -46,7 +46,7 @@ public interface ControlAPI : FlashAPI
     /// start timers which monitor the blockchain for new relevant tx's
     public void ctrlStart();
 
-    public void ctrlUnilateralClose (in Hash chan_id);
+    public void ctrlPublishUpdate (in Hash chan_id, in uint index);
 
     public void ctrlCooperativeClose (in Hash chan_id);
 
@@ -130,11 +130,11 @@ public class ControlFlashNode : FlashNode, ControlAPI
         return chan_id;
     }
 
-    public override void ctrlUnilateralClose (in Hash chan_id)
+    public override void ctrlPublishUpdate (in Hash chan_id, in uint index)
     {
         auto channel = chan_id in this.channels;
         assert(channel !is null);
-        channel.beginUnilateralClose();
+        channel.ctrlPublishUpdate(index);
     }
 
     /// Control API
@@ -290,9 +290,11 @@ unittest
     alice.ctrlUpdateBalance(chan_id, Amount(8_000),  Amount(7_000));
 
     writefln("Alice unilaterally closing the channel..");
-    alice.ctrlUnilateralClose(chan_id);
-
+    alice.ctrlPublishUpdate(chan_id, 0);
     network.expectBlock(Height(11), network.blocks[0].header);
+
+    alice.ctrlPublishUpdate(chan_id, 1);
+    network.expectBlock(Height(12), network.blocks[0].header);
 
     //// now we publish trigger tx
     //const block_2 = node_1.getBlocksFrom(0, 1024)[$ - 1];
