@@ -140,6 +140,20 @@ public class Channel
     /***************************************************************************
 
         Returns:
+            true if the channel is currently in the process of collecting
+            a signature. During that time new balance updates will not be
+            accepted.
+
+    ***************************************************************************/
+
+    public bool isCollecting ()
+    {
+        return this.signer.isCollecting();
+    }
+
+    /***************************************************************************
+
+        Returns:
             the current state of the channel
 
     ***************************************************************************/
@@ -450,6 +464,11 @@ public class Channel
         // todo: dupe calls should be handled somewhere, so maybe we
         // need a call like `canUpdateBalance(seq_id, ...)`?
         assert(seq_id == this.cur_seq_id + 1);
+
+        // todo: issue: collectSignatures might be sent for a new balance
+        // request, but the counter-party is still collecting the settlement
+        // & update tx for the last sequence. They should make sure they collect
+        // the signatures before accepting a new update balance.
 
         this.cur_seq_id++;
         auto update_pair = this.signer.collectSignatures(this.cur_seq_id,

@@ -36,10 +36,10 @@ import std.format;
 public struct Result (T)
 {
     /// The error code, if any
-    public const ErrorCode error;
+    public ErrorCode error;
 
     /// The error message, if any
-    public const string message;
+    public string message;
 
     /// The result, only valid if `error != ErrorCode.None`
     public T value;

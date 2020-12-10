@@ -185,6 +185,11 @@ public abstract class FlashNode : FlashAPI
             return Result!PublicNonce(ErrorCode.ChannelNotOpen,
                 "This channel is not funded yet");
 
+        if (channel.isCollecting())
+            return Result!PublicNonce(ErrorCode.SigningInProcess,
+                "This channel is still collecting signatures for a "
+                ~ "previous sequence ID");
+
         // todo: need to add sequence ID verification here
         // todo: add logic if we agree with the new balance
         // todo: check sums for the balance so it doesn't exceed

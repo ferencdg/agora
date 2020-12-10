@@ -170,8 +170,22 @@ public class ControlFlashNode : FlashNode, ControlAPI
             peer_nonce : pub_nonce,
         };
 
-        auto result = channel.peer.requestBalanceUpdate(chan_id, new_seq_id,
-            balance_req);
+        Result!PublicNonce result;
+        while (1)
+        {
+            result = channel.peer.requestBalanceUpdate(chan_id, new_seq_id,
+                balance_req);
+            if (result.error == ErrorCode.SigningInProcess)
+            {
+                writefln("Signing not yet complete: %s. Waiting..",
+                    result.message);
+                this.taskman.wait(100.msecs);
+                continue;
+            }
+
+            break;
+        }
+
         assert(result.error == ErrorCode.None, result.to!string);
         channel.updateBalance(new_seq_id, priv_nonce, result.value, balance);
     }

@@ -113,9 +113,12 @@ public class Signer
         in PrivateNonce priv_nonce, in PublicNonce peer_nonce,
         in Transaction prev_tx)
     {
-        scope (exit) this.clearState();
+        // note: don't clear on exit, counter-party may still await signatures.
+        this.clearState();
+
         this.seq_id = seq_id;
         this.is_collecting = true;
+        scope (exit) this.is_collecting = false;
 
         this.pending_update = this.createPendingUpdate(priv_nonce, peer_nonce,
             prev_tx);
@@ -370,6 +373,5 @@ public class Signer
     {
         this.pending_settle = PendingSettle.init;
         this.pending_update = PendingUpdate.init;
-        this.is_collecting = false;
     }
 }
