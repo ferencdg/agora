@@ -163,6 +163,7 @@ public void hashPart (ulong record, scope HashDg state) /*pure*/ nothrow @nogc @
 /// Ditto
 public void hashPart (in char[] record, scope HashDg state) /*pure*/ nothrow @nogc @trusted
 {
+    hashPart(cast(const ulong) record.length, state);
     state(cast(const ubyte[])record);
 }
 
@@ -170,6 +171,7 @@ public void hashPart (in char[] record, scope HashDg state) /*pure*/ nothrow @no
 public void hashPart (in ubyte[] record, scope HashDg state)
     /*pure*/ nothrow @nogc @safe
 {
+    hashPart(cast(const ulong) record.length, state);
     state(record);
 }
 
@@ -177,6 +179,7 @@ public void hashPart (in ubyte[] record, scope HashDg state)
 public void hashPart (T) (in T[] records, scope HashDg state)
     /*pure*/ nothrow @nogc @safe
 {
+    hashPart(cast(const ulong) records.length, state);
     foreach (ref record; records)
         hashPart(record, state);
 }
@@ -196,7 +199,6 @@ nothrow @nogc @safe unittest
         0xD4, 0x00, 0x99, 0x23
     ];
     const abc_exp = Hash(hdata, /*isLittleEndian:*/ true);
-    assert(hashFull("abc") == abc_exp);
 
     static struct Composed
     {
@@ -260,13 +262,15 @@ nothrow @nogc @safe unittest
     Hash foo = hashFull("foo");
     Hash bar = hashFull("bar");
     const merged = Hash(
-        "0xe0343d063b14c52630563ec81b0f91a84ddb05f2cf05a2e4330ddc79bd3a06e57" ~
-        "c2e756f276c112342ff1d6f1e74d05bdb9bf880abd74a2e512654e12d171a74");
+        "0xce62c5ee0425df4e45054193165b94f018a0949188e50a6987899af19044217" ~
+        "6dca1405fa874fc6f8535bc4b2605c9532d6b039ada83e419740dd907783524b0");
 
     assert(hashMulti(foo, bar) == merged);
-
+    const array_hash = Hash(
+        "0x2fe6338485a01e4f2d93e7e7bc879d9839912ea6def31b93dabc772d95b12691" ~
+        "bb238bbd3ff0872c05e890c9b9ca33c08e19cc94b9b12370b864c0992a7be61f");
     const Hash[2] array = [foo, bar];
-    assert(hashFull(array[]) == merged);
+    assert(hashFull(array[]) == array_hash);
 
     static struct S
     {
@@ -288,4 +292,18 @@ nothrow @nogc @safe unittest
     auto hash_1 = hashMulti(420, "bpfk", S('a', 0, 'b', 0, 'c', 0));
     auto hash_2 = hashMulti(420, "bpfk", S('a', 1, 'b', 2, 'c', 3));
     assert(hash_1 == hash_2);
+}
+
+// https://github.com/bpfkorea/agora/issues/1331
+unittest
+{
+    static struct S
+    {
+        ubyte[] arr1;
+        ubyte[] arr2;
+    }
+
+    auto s1 = S([0], null);
+    auto s2 = S(null, [0]);
+    assert(s1.hashFull() != s2.hashFull());
 }

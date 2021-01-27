@@ -483,7 +483,7 @@ unittest
         assert(!block.isGenesisBlockValid());
 
         // at least 1 tx needed (todo: relax this?)
-        block.txs ~= txs[0];
+        block.txs ~= txs[1];
         buildMerkleTree(block);
         checkValidity(block);
 
@@ -856,8 +856,8 @@ unittest
         findNonSpent, Enrollment.MinValidatorCount, genesis_validator_keys.length, checker, findGenesisEnrollments));
 
     // All `payment` utxos have been consumed
-    assert(GenesisBlock.txs[0].type == TxType.Freeze);
-    assert(used_set.length + GenesisBlock.txs[0].outputs.length == utxo_set_len);
+    assert(GenesisBlock.txs[1].type == TxType.Freeze);
+    assert(used_set.length + GenesisBlock.txs[1].outputs.length == utxo_set_len);
 
     // reset state
     used_set.clear();
