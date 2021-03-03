@@ -79,6 +79,12 @@ public struct Set (T)
             this.put(key);
     }
 
+    /// Returns true if the set has the element e, otherwise returns false
+    public auto opBinary (string op)(in T e) nothrow const pure @safe @nogc if (op == "in")
+    {
+        return e in _set;
+    }
+
     /***************************************************************************
 
         Serialization support
