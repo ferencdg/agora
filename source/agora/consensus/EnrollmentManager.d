@@ -1216,7 +1216,7 @@ public class EnrollmentManager
     ***************************************************************************/
 
     public UTXO[] getValidatorStakes (UTXOFinder peekUTXO, ref UTXO[] utxos,
-        const ref uint[] missing_validators) @trusted nothrow
+        in uint[] missing_validators) @trusted nothrow
     {
         return this.validator_set.getValidatorStakes(peekUTXO, utxos,
             missing_validators);
