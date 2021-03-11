@@ -1791,6 +1791,15 @@ public struct TestConf
     /// The amount of a penalty for slashed validators
     Amount slash_penalty_amount = 10_000.coins;
 
+    /// The number of blocks between 2 block reward payout
+    /// The value of 3 means block reward payout happens at at block 1, 4, 7...
+    public ushort block_reward_gap = 10;
+
+    /// The delay (measured in blocks) after which block reward is payed
+    /// The value of 5 means the block reward payout for confirming blocks
+    /// [(X-confirmation_payout_gap), (X)] happens at block (X + block_reward_delay)
+    public ushort block_reward_delay = 5;
+
 }
 
 /*******************************************************************************
@@ -1835,6 +1844,8 @@ public APIManager makeTestNetwork (APIManager : TestAPIManager = TestAPIManager)
             validator_tx_fee_cut : test_conf.validator_tx_fee_cut,
             payout_period : test_conf.payout_period,
             slash_penalty_amount : test_conf.slash_penalty_amount,
+            block_reward_gap : test_conf.block_reward_gap,
+            block_reward_delay : test_conf.block_reward_delay,
         };
 
         return result;

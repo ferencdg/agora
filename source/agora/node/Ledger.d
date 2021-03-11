@@ -26,6 +26,7 @@ import agora.common.Config;
 import agora.common.ManagedDatabase;
 import agora.common.Set;
 import agora.common.Types;
+import agora.consensus.BlockRewardCalc;
 import agora.consensus.data.Block;
 import agora.consensus.protocol.Data;
 import agora.consensus.data.Enrollment;
@@ -126,6 +127,9 @@ public class Ledger
     /// but less than current time + block_time_offset_tolerance
     public Duration block_time_offset_tolerance;
 
+    /// Block Reward Calculator
+    private BlockRewardCalc block_reward_calc;
+
     /***************************************************************************
 
         Constructor
@@ -165,6 +169,7 @@ public class Ledger
         this.clock = clock;
         this.block_time_offset_tolerance = block_time_offset_tolerance;
         this.storage.load(params.Genesis);
+        this.block_reward_calc = new BlockRewardCalc(params);
 
         // ensure latest checksum can be read
         this.last_block = this.storage.readLastBlock();
@@ -354,6 +359,74 @@ public class Ledger
 
         this.tx_stats.increaseMetricBy!"agora_transactions_accepted_total"(1);
         return true;
+    }
+
+    /***************************************************************************
+
+        Returns the public keys of the validators that signed the block at
+        the specified height, and and also not classified as 'missing' validator
+
+        Params:
+            height = block height
+
+        Returns: the public keys of the validators that signed the block at
+                 the specified height, and and also not
+                 classified as 'missing' validator
+
+    ***************************************************************************/
+
+    private Point[] getPKeysOfSignedNonMissingValidators (Height height) nothrow @safe
+    {
+        Point[] keys;
+        Block block;
+        try
+        {
+            block = this.storage.readBlock(height);
+        }
+        catch (Exception e) {
+            log.error("unable to read block at height: {}", height);
+            return keys;
+        }
+
+        immutable validator_cnt = enroll_man.getCountOfValidators(height);
+        foreach (i; 0 .. validator_cnt)
+        {
+            auto validator_pkey = enroll_man.getValidatorAtIndex(height, i);
+            if (block.header.validators[i] && !block.header.missing_validators.canFind(i))
+                keys ~= validator_pkey;
+        }
+
+        return keys;
+    }
+
+    /***************************************************************************
+
+        Returns a map indexed by the public keys of validators who signed blocks
+            and also not classified as 'missing' validator at least once between
+            `start_height` and `end_height`
+
+        The value corresponding to the public key shows how many blocks the
+        validator signed between `start_height` and `end_height`
+
+        Params:
+            start_height = starting block height(inclusive)
+            end_height = ending block height(inclusive)
+
+        Returns: a map indexed by public keys of validators who signed blocks
+                 and also not classified as 'missing' validator at least once
+                 between `start_height` and `end_height`
+
+    ***************************************************************************/
+
+    private ushort[Point] getPKeysOfSignedNonMissingValidators (Height start_height, Height end_height) nothrow @safe
+    {
+        ushort[Point] signed_cnt_keys_map;
+
+        foreach (height; start_height .. end_height + 1)
+            foreach (point; getPKeysOfSignedNonMissingValidators(height))
+                signed_cnt_keys_map[point]++;
+
+        return signed_cnt_keys_map;
     }
 
     /***************************************************************************
@@ -555,17 +628,21 @@ public class Ledger
             tot_fee = Total fee amount (incl. data)
             tot_data_fee = Total data fee amount
             missing_validators = MPVs
+            height = the height for which the coinbase transaction should be returned
 
         Returns:
-            List of expected Coinbase TXs
+            One or zero Coinbase TX
 
     ***************************************************************************/
 
     public Transaction[] getCoinbaseTX (in Amount tot_fee, in Amount tot_data_fee,
-        in uint[] missing_validators) nothrow @safe
+        in uint[] missing_validators, in Height height) nothrow @safe
     {
         const next_height = this.getBlockHeight() + 1;
 
+        ////////
+        // calculating transaction fee reward
+        ///////
         UTXO[] stakes;
         this.enroll_man.getValidatorStakes(&this.utxo_set.peekUTXO, stakes,
             missing_validators);
@@ -579,17 +656,75 @@ public class Ledger
             [],
         );
 
+        ulong[Point] pkey_to_output_ind;
         // pay the commons budget
         if (commons_fee > Amount(0))
+        {
             coinbase_tx.outputs ~= Output(commons_fee,
                 this.params.CommonsBudgetAddress);
+            pkey_to_output_ind[this.params.CommonsBudgetAddress.data] = pkey_to_output_ind.length;
+        }
 
         // pay the validator for the past blocks
         if (auto payouts = this.fee_man.getAccumulatedFees(next_height))
             foreach (pair; payouts.byKeyValue())
                 if (pair.value > Amount(0))
+                {
                     coinbase_tx.outputs ~= Output(pair.value, pair.key);
+                    pkey_to_output_ind[pair.key.data] = pkey_to_output_ind.length;
+                }
 
+        ////////
+        // calculating block reward
+        ///////
+        if (block_reward_calc.is_payout_time(height))
+        {
+            immutable period_end = Height(height - params.BlockRewardDelay);
+            immutable period_start = Height(period_end - params.BlockRewardGap + 1);
+            Amount remainder;
+
+            // calculate the penalty for missing singatures
+            auto pkey_sigcounts = getPKeysOfSignedNonMissingValidators(period_start, period_end);
+            double total_actual_sigcount = pkey_sigcounts.byValue().fold!((a, b) => a + b)(0);
+            double total_expected_sigcount = iota(period_start.value, period_end.value + 1)
+                .map!(height => this.enroll_man.getCountOfValidators(Height(height))).fold!((a, b) => a + b)(cast(size_t) 0);
+            immutable comply_perc = (total_actual_sigcount / total_expected_sigcount) * 100;
+
+            // calculate the validator block reward for each validator
+            auto each_validator_reward = this.block_reward_calc.getEachValidatorReward(
+                            height, getPKeysOfSignedNonMissingValidators(period_start, period_end), remainder, comply_perc);
+
+            // calculate the foundation block reward
+            Amount foundation_reward = this.block_reward_calc.getTotalCommonsBudgetReward(height, comply_perc);
+            foundation_reward.mustAdd(remainder);
+            each_validator_reward.update(
+                Point(params.CommonsBudgetAddress[]),
+                {
+                    auto amount = Amount(foundation_reward);
+                    return amount;
+                },
+                (ref Amount amount)
+                {
+                    amount.mustAdd(foundation_reward);
+                    return amount;
+                }
+            );
+
+            // merge the block reward with fee reward
+            foreach (ref pkey_reward; each_validator_reward.byKeyValue())
+                if (pkey_reward.value != Amount(0))
+                {
+                    if (auto pkey_ind_found = (pkey_reward.key in pkey_to_output_ind))
+                        coinbase_tx.outputs[*pkey_ind_found].value.mustAdd(pkey_reward.value);
+                    else
+                        coinbase_tx.outputs ~= Output(pkey_reward.value, PublicKey(pkey_reward.key[]));
+                }
+
+        }
+
+        // This method returns an array of coinbase transaction even if the array
+        // contains at most one element. Returning an array as opposed to a
+        // Nullable!Transaction greatly simplifies the calling code
         return coinbase_tx.outputs.length > 0 ? [coinbase_tx] : [];
     }
 
@@ -609,19 +744,20 @@ public class Ledger
         Params:
             tx_set = Transaction set to generate the CoinBase TX for
             missing_validators = MPVs
+            height = the height for which the coinbase transaction should be returned
 
         Returns:
-            List of expected Coinbase TXs
+            One or zero Coinbase TX
 
     ***************************************************************************/
 
     public Transaction[] getCoinbaseTX (in Transaction[] tx_set,
-        in uint[] missing_validators) nothrow @safe
+        in uint[] missing_validators, Height height) nothrow @safe
     {
         Amount tot_fee, tot_data_fee;
         this.fee_man.getTXSetFees(tx_set, &this.utxo_set.peekUTXO, tot_fee,
             tot_data_fee);
-        return this.getCoinbaseTX(tot_fee, tot_data_fee, missing_validators);
+        return this.getCoinbaseTX(tot_fee, tot_data_fee, missing_validators, height);
     }
 
     /***************************************************************************
@@ -916,7 +1052,7 @@ public class Ledger
         }
 
         auto expected_cb_txs = this.getCoinbaseTX(tot_fee,
-            tot_data_fee, data.missing_validators);
+            tot_data_fee, data.missing_validators, expect_height);
         auto excepted_cb_hashes = expected_cb_txs.map!(tx => tx.hashFull());
         assert(expected_cb_txs.length <= 1);
 
@@ -1065,7 +1201,7 @@ public class ValidatingLedger : Ledger
         // Dont append a CB TX to an empty TX set
         if (pre_cb_len > 0)
             data.tx_set ~= this.getCoinbaseTX(tot_fee, tot_data_fee,
-                data.missing_validators).map!(tx => tx.hashFull()).array;
+                data.missing_validators, next_height).map!(tx => tx.hashFull()).array;
         // No more than 1 CB per block
         assert(data.tx_set.length - pre_cb_len <= 1);
     }
@@ -1927,7 +2063,7 @@ unittest
     const Transaction[] empty_tx_set;
     const uint[] empty_mpvs;
 
-    auto cb_tx_set = ledger.getCoinbaseTX(empty_tx_set, empty_mpvs);
+    auto cb_tx_set = ledger.getCoinbaseTX(empty_tx_set, empty_mpvs, Height(1));
     data.tx_set ~= cb_tx_set.map!(tx => tx.hashFull()).array;
     assert(data.tx_set.length == 1);
     // Coinbase only nomination, Should not validate

@@ -107,7 +107,7 @@ public string isInvalidReason (in Block block, Engine engine, Height prev_height
     Point delegate (in Height, ulong) nothrow @safe getValidatorAtIndex,
     Point delegate (in Point, in Height) nothrow @safe getCommitmentNonce,
     ulong prev_time_offset, ulong curr_time_offset, Duration block_time_tolerance,
-    Transaction[] delegate (in Transaction[] tx_set, in uint[] missing_validators)
+    Transaction[] delegate (in Transaction[] tx_set, in uint[] missing_validators, Height height)
                                nothrow @safe getCoinbaseTX,
     string file = __FILE__, size_t line = __LINE__) nothrow @safe
 {
@@ -147,13 +147,6 @@ public string isInvalidReason (in Block block, Engine engine, Height prev_height
 
     if (only_coinbase)
         return "Block: Must contain other transactions than Coinbase";
-
-    auto expected_cb_txs = getCoinbaseTX(block.txs,
-        block.header.missing_validators);
-    auto incoming_cb_txs = block.txs.filter!(
-            tx => tx.type == TxType.Coinbase);
-    if (!isPermutation(expected_cb_txs, incoming_cb_txs))
-        return "Invalid Coinbase transaction";
 
     Hash[] merkle_tree;
     if (block.header.merkle_root != Block.buildMerkleTree(block.txs, merkle_tree))
@@ -679,7 +672,7 @@ version (unittest)
             },
             prev_time_offset, (curr_time_offset == ulong.max) ? block.header.time_offset : curr_time_offset,
             block_time_tolerance,
-            (in Transaction[] tx_set, in uint[] missing_validators)
+            (in Transaction[] tx_set, in uint[] missing_validators, Height height)
             {
                 return (Transaction[]).init;
             });
