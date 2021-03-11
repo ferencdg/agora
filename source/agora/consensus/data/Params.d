@@ -167,7 +167,7 @@ public struct ConsensusConfig
     ];
 
     /// Default block rewards given to validators
-    /// Not assigned directly to block_rewards here to avoid
+    /// Not assigned directly to `validator_block_rewards` here to avoid
     /// 'cannot inline default argument' compiler error
     private static immutable BlockRewardsTup[] DefaultValidatorBlockRewards =
     [
