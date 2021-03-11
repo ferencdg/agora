@@ -16,7 +16,7 @@ module agora.test.BlockReward;
 import agora.test.Base;
 import agora.consensus.data.Transaction;
 import agora.common.Amount;
-import agora.common.crypto.Key;
+import agora.crypto.Key;
 import agora.utils.WellKnownKeys;
 
 unittest

@@ -228,7 +228,7 @@ public class BlockRewardCalc
         immutable period_end = height - consensus_params.BlockRewardDelay;
         immutable period_start = period_end - consensus_params.BlockRewardGap + 1;
 
-        // checking wether we should pay block rewards at this particular height
+        // checking wheter we should pay block rewards at this particular height
         if (period_end % consensus_params.BlockRewardGap != 0)
             return false;
 
