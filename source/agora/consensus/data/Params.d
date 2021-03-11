@@ -66,7 +66,7 @@ public immutable class ConsensusParams
     public this (immutable(Block) genesis,
                  in PublicKey commons_budget_address,
                  ConsensusConfig config = ConsensusConfig.init,
-                 Duration block_interval = 1.seconds)
+                 Duration block_interval = 1.seconds) @safe pure nothrow
     {
         this.Genesis = genesis;
         this.CommonsBudgetAddress = commons_budget_address,
@@ -77,7 +77,7 @@ public immutable class ConsensusParams
     /// Default for unittest, uses the test genesis block
     version (unittest) public this (
         uint validator_cycle = 1008, uint max_quorum_nodes = 7,
-        uint quorum_threshold = 80)
+        uint quorum_threshold = 80) @safe pure nothrow
     {
         const genesis_timestamp = 1609459200;  // 2021-01-01:00:00:00 GMT
         import agora.consensus.data.genesis.Test : GenesisBlock;
