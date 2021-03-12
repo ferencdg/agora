@@ -26,67 +26,13 @@ import agora.consensus.state.UTXODB;
 import agora.crypto.Schnorr;
 import agora.utils.Test;
 import agora.test.Base;
+import agora.test.Common;
 
 import core.atomic;
 import core.stdc.stdint;
 import core.thread;
 
 import geod24.Registry;
-
-// This derived `EnrollmentManager` does not reveal any preimages
-// after enrollment.
-private class MissingPreImageEM : EnrollmentManager
-{
-    private shared bool* reveal_preimage;
-
-    ///
-    public this (Parameters!(EnrollmentManager.__ctor) args,
-        shared(bool)* reveal_preimage)
-    {
-        assert(reveal_preimage !is null);
-        this.reveal_preimage = reveal_preimage;
-        super(args);
-    }
-
-    /// This does not reveal pre-images intentionally
-    public override bool getNextPreimage (out PreImageInfo preimage,
-        Height height) @safe
-    {
-        if (!atomicLoad(*this.reveal_preimage))
-            return false;
-
-        return super.getNextPreimage(preimage, height);
-    }
-}
-
-// This derived TestValidatorNode does not reveal any preimages using the
-// `MissingPreImageEM` class
-private class NoPreImageVN : TestValidatorNode
-{
-    public static shared UTXOSet utxo_set;
-    private shared bool* reveal_preimage;
-
-    ///
-    public this (Parameters!(TestValidatorNode.__ctor) args,
-        shared(bool)* reveal_preimage)
-    {
-        this.reveal_preimage = reveal_preimage;
-        super(args);
-    }
-
-    protected override EnrollmentManager getEnrollmentManager ()
-    {
-        return new MissingPreImageEM(
-            ":memory:", this.config.validator.key_pair, params,
-            this.reveal_preimage);
-    }
-
-    protected override UTXOSet getUtxoSet()
-    {
-        this.utxo_set = cast(shared UTXOSet)super.getUtxoSet();
-        return cast(UTXOSet)this.utxo_set;
-    }
-}
 
 /// Situation: A misbehaving validator does not reveal its preimages right after
 ///     it's enrolled.
@@ -95,26 +41,11 @@ private class NoPreImageVN : TestValidatorNode
 ///     validators with the 10K of the fund going to the `CommonsBudget` address.
 unittest
 {
-    static class BadAPIManager : TestAPIManager
-    {
-        public static shared bool reveal_preimage = false;
-
-        mixin ForwardCtor!();
-
-        ///
-        public override void createNewNode (Config conf, string file, int line)
-        {
-            if (this.nodes.length == 5)
-                this.addNewNode!NoPreImageVN(conf, &reveal_preimage, file, line);
-            else
-                super.createNewNode(conf, file, line);
-        }
-    }
 
     TestConf conf = {
         recurring_enrollment : false,
     };
-    auto network = makeTestNetwork!BadAPIManager(conf);
+    auto network = makeTestNetwork!(MissingPreimageAPIManager!([5]))(conf);
     network.start();
     scope(exit) network.shutdown();
     scope(failure) network.printLogs();
