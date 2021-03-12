@@ -86,6 +86,13 @@ public struct Amount
         return ret;
     }
 
+    /// Non-throwing version of toString
+    public string toStringNT () const @safe nothrow
+    {
+        try return this.toString();
+        catch (Exception e) {return "";}
+    }
+
     /// Support for Vibe.d deserialization
     public static Amount fromString (scope const(char)[] str) pure @safe
     {
